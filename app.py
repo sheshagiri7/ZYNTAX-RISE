@@ -1,18 +1,32 @@
 """
 ZYNTAX Backend API Service
 ==========================
-RISE @ RST #5 Hackathon API entrypoint.
-Decoupled architecture:
-- POST /chat   -> Powered by Member 3 (chat_engine.py)
-- POST /ingest -> Decoupled Kafka producer (Member 2)
-- GET /status  -> Progress reporter (Member 2)
-- GET /health  -> Service healthcheck (Member 2)
+RISE @ RST #5 Hackathon API Entrypoint.
+
+API Contracts & Architecture:
+-----------------------------
+- POST /ingest -> Validates CSV, publishes one message per row to Kafka, returns 202 Accepted.
+- GET /status  -> Returns real-time ingestion status and row counts honestly.
+- GET /health  -> Accurately verifies Kafka and Neo4j connectivity before reporting 'ok'.
+- POST /chat   -> Grounded Q&A over Neo4j dynamic graph model via Member 3's chat_engine.
 """
 
 import os
 import logging
 from flask import Flask, request, jsonify
-from neo4j import GraphDatabase
+from backend.config import (
+    PORT,
+    HOST,
+    NEO4J_DATABASE
+)
+from backend.kafka_client import is_kafka_connected, set_producer
+from backend.neo4j_client import (
+    get_neo4j_driver,
+    set_neo4j_driver,
+    is_neo4j_connected
+)
+from backend.ingest import process_csv_upload
+from backend.status import get_job_status
 from chat_engine import handle_chat
 
 # Configure logging
@@ -21,34 +35,15 @@ logger = logging.getLogger("zyntax.api")
 
 app = Flask(__name__)
 
-# -----------------------------------------------------------------------------
-# NEO4J CONFIGURATION (Official Handout Part 2.4)
-# -----------------------------------------------------------------------------
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "csvgraphdb")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "CSV_Graph_DB")
-
-_driver = None
-
+# Lazy driver access and test injection compatibility for Member 3
 def get_driver():
-    """
-    Returns the active Neo4j driver with lazy initialization.
-    Prevents API container crash if Neo4j is still starting up.
-    """
-    global _driver
-    if _driver is None:
-        try:
-            _driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-            logger.info(f"Connected to Neo4j at {NEO4J_URI} (db: {NEO4J_DATABASE})")
-        except Exception as e:
-            logger.warning(f"Neo4j driver initialization deferred/failed: {e}")
-    return _driver
+    return get_neo4j_driver()
 
 def set_driver(custom_driver):
-    """Allows setting or mocking the driver for testing."""
-    global _driver
-    _driver = custom_driver
+    set_neo4j_driver(custom_driver)
+
+def set_kafka(custom_producer):
+    set_producer(custom_producer)
 
 
 # -----------------------------------------------------------------------------
@@ -63,7 +58,85 @@ def add_cors_headers(response):
 
 
 # -----------------------------------------------------------------------------
-# CHATBOT ENDPOINT (Member 3 - RISE @ RST #5 Contract)
+# 1. HEALTH CHECK ENDPOINT (Official Contract)
+# -----------------------------------------------------------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    GET /health
+    Expected structure:
+    {
+      "status": "ok" | "degraded",
+      "kafka_connected": bool,
+      "neo4j_connected": bool
+    }
+    The API must NOT report "ok" until Kafka and Neo4j are genuinely reachable.
+    """
+    kafka_ok = is_kafka_connected()
+    neo4j_ok = is_neo4j_connected()
+
+    # Status must be "ok" ONLY when both services are connected
+    status_str = "ok" if (kafka_ok and neo4j_ok) else "degraded"
+
+    return jsonify({
+        "status": status_str,
+        "kafka_connected": kafka_ok,
+        "neo4j_connected": neo4j_ok
+    }), 200
+
+
+# -----------------------------------------------------------------------------
+# 2. INGESTION ENDPOINT (Official Contract)
+# -----------------------------------------------------------------------------
+@app.route("/ingest", methods=["POST", "OPTIONS"])
+def ingest():
+    """
+    POST /ingest
+    Content-Type: multipart/form-data
+    Field: file
+
+    Expected response (202 Accepted):
+    {
+      "job_id": "b3f1",
+      "rows_received": 1000,
+      "status": "queued"
+    }
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    if "file" not in request.files:
+        return jsonify({"error": "Missing 'file' in multipart form data."}), 400
+
+    file_storage = request.files["file"]
+    response_payload, status_code = process_csv_upload(file_storage)
+    return jsonify(response_payload), status_code
+
+
+# -----------------------------------------------------------------------------
+# 3. STATUS ENDPOINT (Official Contract)
+# -----------------------------------------------------------------------------
+@app.route("/status", methods=["GET"])
+def status():
+    """
+    GET /status?job_id=b3f1
+    Expected structure:
+    {
+      "job_id": "b3f1",
+      "status": "loading",
+      "rows_total": 1000,
+      "rows_loaded": 640,
+      "rows_failed": 3
+    }
+    Status must honestly be one of: queued, loading, complete, failed.
+    """
+    job_id = request.args.get("job_id")
+    response_payload, status_code = get_job_status(job_id)
+    return jsonify(response_payload), status_code
+
+
+# -----------------------------------------------------------------------------
+# 4. CHATBOT ENDPOINT (Member 3 - RISE @ RST #5 Contract)
 # -----------------------------------------------------------------------------
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
@@ -99,55 +172,12 @@ def chat():
 
 
 # -----------------------------------------------------------------------------
-# SKELETON PLACEHOLDERS FOR MEMBER 2 (INGEST, STATUS, HEALTH)
-# -----------------------------------------------------------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check verifying Kafka and Neo4j connectivity."""
-    neo4j_ok = False
-    driver = get_driver()
-    if driver:
-        try:
-            with driver.session(database=NEO4J_DATABASE) as s:
-                s.run("RETURN 1").single()
-            neo4j_ok = True
-        except Exception:
-            neo4j_ok = False
-
-    status_str = "ok" if neo4j_ok else "degraded"
-    return jsonify({
-        "status": status_str,
-        "kafka_connected": False,  # Managed by Member 2
-        "neo4j_connected": neo4j_ok
-    }), 200
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    """Progress reporter for CSV ingestion jobs (Member 2)."""
-    job_id = request.args.get("job_id", "default")
-    return jsonify({
-        "job_id": job_id,
-        "status": "queued",
-        "rows_total": 0,
-        "rows_loaded": 0,
-        "rows_failed": 0
-    }), 200
-
-
-@app.route("/ingest", methods=["POST"])
-def ingest():
-    """CSV upload handler (Member 2)."""
-    return jsonify({
-        "job_id": "job-pending",
-        "rows_received": 0,
-        "status": "queued"
-    }), 202
-
-
-# -----------------------------------------------------------------------------
 # ERROR HANDLERS (Always return JSON)
 # -----------------------------------------------------------------------------
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": str(e), "grounded": False}), 400
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"error": "Resource not found", "grounded": False}), 404
@@ -168,7 +198,5 @@ def internal_error(e):
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    host = os.getenv("HOST", "0.0.0.0")
-    logger.info(f"Starting ZYNTAX API on {host}:{port}")
-    app.run(host=host, port=port, debug=False)
+    logger.info(f"Starting ZYNTAX API on {HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=False)

@@ -22,6 +22,8 @@ ENV/
 env.bak/
 venv.bak/
 .pytest_cache/
+.job_state.json
+*.json.tmp
 
 # Node / Frontend
 node_modules/
