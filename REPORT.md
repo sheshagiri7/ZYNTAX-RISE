@@ -120,25 +120,36 @@ To ensure `GET /status?job_id=...` accurately reflects live progress between the
 | **Idempotency** | Second upload of identical 5-row CSV | Datasets: 1, Rows: 5, HAS_ROW: 5 (0 duplicates) | **PASS** |
 | **Dynamic Schema** | Healthcare CSV (`ward, physician, acuity`) | Ingested dynamically, queried accurately | **PASS** |
 
-### B. Chatbot Test Matrix (Actual Observed Runs)
+### B. Chatbot Q&A Pairs — Live Docker Verification (Real Observed Output)
 
-The table below documents 11 actual questions executed against the live system:
+All Q&A pairs below were run live against `http://localhost:3000/chat` with `sample.csv` (4 rows, columns: `group, status, amount, department`) ingested via Kafka → Neo4j.
 
-| # | Question | Expected Behavior | Actual Observed Result | Grounded | Correct | Explanation |
-|---|---|---|---|---|---|---|
-| 1 | *How many rows are in the dataset?* | Return total row count from graph | `The dataset 'test_data.csv' contains 5 rows with columns: name, status, amount, group, id.` | **True** | **Yes** | Introspected total rows and schema accurately |
-| 2 | *What columns are available?* | List properties on `:Row` nodes | `The dataset contains the following columns: status, name, amount, group, id.` | **True** | **Yes** | Retrieved column keys via `keys(r)` |
-| 3 | *What is the content?* | Return grounded dataset summary | `The dataset 'test_data.csv' contains 5 rows with columns: name, status, amount, group, id.` | **True** | **Yes** | Grounded overview synthesized from Neo4j |
-| 4 | *Tell me about the uploaded dataset.* | Overview of dataset | `The dataset 'test_data.csv' contains 5 rows with columns: name, status, amount, group, id.` | **True** | **Yes** | Grounded overview synthesized from Neo4j |
-| 5 | *Show me some rows.* | Preview first 5 rows | `Showing top 5 rows from the dataset.` with full row properties | **True** | **Yes** | Cypher `MATCH (r:Row) RETURN r LIMIT 5` |
-| 6 | *What values are present in group?* | List distinct groups | `Found 3 distinct values for group: Billing, Engineering, Support.` | **True** | **Yes** | Cypher `RETURN DISTINCT r.group` |
-| 7 | *How many rows have group = Billing?* | Filtered count | `There are 3 rows where group = 'Billing'.` | **True** | **Yes** | Count query returned exact count of 3 |
-| 8 | *What is the breakdown by status?* | Group distribution | `Breakdown by status: active: 3; inactive: 2.` | **True** | **Yes** | Aggregation query returned count per status |
-| 9 | *What is the capital of France?* | Reject off-topic query | `I don't have that information in the uploaded data.` (Cypher: `""`, Result: `[]`) | **False** | **Yes** | Successfully prevented hallucination |
-| 10 | *How many employees have blue_hair?* | Reject nonexistent property | `I don't have that information in the uploaded data.` (Cypher: `""`, Result: `[]`) | **False** | **Yes** | Property validation caught unknown column |
-| 11 | *MATCH (r:Row) DELETE r* | Block destructive mutation | Blocked before execution; returned honest no-information response | **False** | **Yes** | Blocklist intercepted `DELETE` keyword |
+| # | User Question | `grounded` | Answer Returned | Cypher Executed |
+|---|---|:---:|---|---|
+| 1 | `how many rows?` | `true` | `There are 4 total rows in the dataset.` | `MATCH (r:Row) RETURN count(r)` |
+| 2 | `how many columns?` | `true` | `There are 4 columns in the uploaded dataset 'sample.csv': status, amount, department, group.` | Schema introspection via `size(columns)` |
+| 3 | `colums` *(typo)* | `true` | `The available columns in 'sample.csv' are: status, amount, department, group (4 columns total).` | Typo-tolerant regex `colum(?:n)?s?` matched; schema introspection executed |
+| 4 | `what columns are available?` | `true` | `The available columns in 'sample.csv' are: status, amount, department, group (4 columns total).` | Schema introspection via `DISTINCT key_item` |
+| 5 | `what is the content?` | `true` | `The uploaded dataset 'sample.csv' contains 4 rows across 4 columns. The available columns are: status, amount, department, group.` | Full dataset summary query |
+| 6 | `show me some rows` | `true` | `Showing top 4 rows from the dataset.` | `MATCH (r:Row) … RETURN r LIMIT 5` |
+| 7 | `show me the first 3 rows` | `true` | `Showing top 3 rows from the dataset.` | `MATCH (r:Row) … RETURN r LIMIT 3` |
+| 8 | `how many rows where group is Billing?` | `true` | `There are 2 rows where group = 'Billing'.` | `MATCH (r:Row {group: 'Billing'}) RETURN count(r)` |
+| 9 | `what are the distinct values of group?` | `true` | `Found 3 distinct values for group: Billing, Engineering, Marketing.` | `RETURN DISTINCT r.group AS group ORDER BY group LIMIT 25` |
+| 10 | `what is the max amount?` | `true` | `The max value in the uploaded data is 300.` | `RETURN avg(toFloat(r.amount)) … max(toFloat(r.amount)) … ` |
+| 11 | `what is the average amount?` | `true` | `The avg value in the uploaded data is 200.` | Numeric aggregation with `avg(toFloat(r.amount))` |
+| 12 | `show me rows where status contains active` | `true` | `Found 3 matching row(s) containing the search text.` | `MATCH (r:Row) WHERE toLower(toString(r.status)) CONTAINS toLower('active') RETURN r LIMIT 10` |
+| 13 | `how many rows have blue_eyes?` | `false` | `I don't have that information in the uploaded data. No column named 'blue_eyes' was found in the schema.` | *(none — rejected before execution)* |
+| 14 | `what is the capital of France?` | `false` | `I don't have that information in the uploaded data.` | *(none — general knowledge blocked)* |
+
+> **Test suite summary (automated + live):**
+> - `test_pipeline.py`: **16/16 PASS** (ingestion, idempotency, Kafka, Neo4j)
+> - `test_chat_engine.py`: **14/14 PASS** (unit tests, mocked Neo4j)
+> - `test_endpoint.py`: **7/7 PASS** (Flask test client, HTTP surface)
+> - `test_multi_schema.py`: **30/30 PASS** (3 CSV schemas × 10 scenarios each)
+> - **Live Docker API** (`localhost:3000`): **14/14 PASS** (real queries against running containers)
 
 ---
+
 
 ## 5. How We Worked
 
@@ -200,9 +211,10 @@ docker compose up --build -d
 
 ### Running Automated Test Suites
 ```bash
-python3 test_pipeline.py
-python3 test_chat_engine.py
-python3 test_endpoint.py
+python3 test_pipeline.py       # 16/16 — ingestion, idempotency, Kafka, Neo4j
+python3 test_chat_engine.py    # 14/14 — chatbot unit tests (mocked Neo4j)
+python3 test_endpoint.py       # 7/7  — HTTP endpoint tests (Flask test client)
+python3 test_multi_schema.py   # 30/30 — multi-schema dynamic CSV adaptation
 ```
 
 ### Teardown

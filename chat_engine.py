@@ -1,46 +1,40 @@
 """
 ZYNTAX Chat Engine (Member 3 - AI / Chatbot / Integration)
 ===========================================================
-Official Hackathon Implementation for RISE @ RST #5.
+Official Hackathon Implementation for RISE @ RST #5:
+"Data In, Answers Out: Build a CSV -> Kafka -> Neo4j Chatbot Pipeline"
 
-Architecture & Responsibilities:
+Core Architecture & Capabilities:
 --------------------------------
-1. Question -> Cypher Mapping:
-   - Dynamic schema discovery: introspects arbitrary CSV properties from Neo4j (:Row) nodes.
-   - Supports natural language variations: handles plural/singular variants, underscores,
-     case-insensitivity, and filter expressions.
-   - Generates deterministic, parameter-safe read-only Cypher queries.
+1. Dynamic Schema Discovery:
+   - Discovers actual available properties dynamically from (:Row) nodes in Neo4j.
+   - Zero hardcoding of column names, row counts, or dataset schemas.
+   - Automatically scopes queries to the most recently uploaded dataset.
+   - Tolerates UTF-8 BOM, case variations, singular/plural, and synonyms.
 
-2. Grounding & Anti-Hallucination:
-   - Validates that referenced properties exist in the graph before querying.
-   - Questions with unknown properties (e.g., 'blue_hair') or off-topic general knowledge
-     (e.g., 'capital of France') are strictly marked grounded=False with cypher="" and result=[].
-   - If the database is empty or no CSV has been ingested, returns grounded=False safely.
-   - Never fabricates numbers or facts; answers are derived 100% from actual Neo4j query results.
+2. Comprehensive Natural-Language Query Intent Engine (12+ Intents):
+   - 1. Row count (all paraphrases)
+   - 2. Column count & Schema inspection (typo-tolerant for "columns" / "colums")
+   - 3. Dataset summary ("What is the content?")
+   - 4. Show / List rows (with extracted or default safe LIMIT)
+   - 5. Distinct values for verified properties
+   - 6. Filtered row counts (property = value)
+   - 7. Filtered row retrieval (property = value with LIMIT)
+   - 8. Breakdown / Group-by / Distribution by property
+   - 9. Numeric aggregations (min, max, average, sum)
+   - 10. String search / substring matching (CONTAINS)
+   - 11. Multi-condition queries (e.g. department=HR AND status=Active)
+   - 12. Lightweight conversational context support
 
-3. Read-Only Safety:
-   - Strict blocklist rejects mutating keywords: CREATE, MERGE, DELETE, DETACH, SET, REMOVE,
-     DROP, ALTER, TRUNCATE, LOAD CSV, APOC write procedures, and multi-statement semicolons.
-   - Only permits safe read-only queries (MATCH / WHERE / RETURN / ORDER BY / LIMIT).
+3. Grounding & Anti-Hallucination:
+   - Questions requiring nonexistent columns return grounded=False with an honest explanation.
+   - Off-topic general knowledge queries return grounded=False.
+   - Pre-upload and empty graph states return grounded=False safely.
+   - Every factual answer is strictly synthesized from actual Neo4j query results.
 
-4. Official Contract Specification (Handout Part 4):
-   POST /chat
-   Request:  {"question": "How many rows belong to the Billing group?"}
-   Response (200 OK):
-   {
-     "answer": "There are 128 rows where group = 'Billing'.",
-     "cypher": "MATCH (r:Row {group: 'Billing'}) RETURN count(r)",
-     "result": [{"count(r)": 128}],
-     "grounded": true
-   }
-
-   Ungrounded / Unsupported Response:
-   {
-     "answer": "I don't have that information in the uploaded data.",
-     "cypher": "",
-     "result": [],
-     "grounded": false
-   }
+4. Read-Only Safety Guard:
+   - Strict blocklist blocks mutating keywords (CREATE, MERGE, DELETE, DETACH, SET, REMOVE,
+     DROP, ALTER, TRUNCATE, LOAD CSV, APOC write procedures, and multi-statement semicolons).
 """
 
 import re
@@ -50,6 +44,15 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 logger = logging.getLogger("zyntax.chat_engine")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+# In-memory recent chat context for conversational follow-ups
+GLOBAL_CHAT_CONTEXT: Dict[str, Any] = {
+    "last_column": None,
+    "last_value": None,
+    "last_dataset_id": None,
+    "last_query_type": None
+}
+
 
 # -----------------------------------------------------------------------------
 # 1. READ-ONLY SAFETY GUARDRAILS
@@ -94,18 +97,21 @@ def is_safe_read_only_cypher(cypher: str) -> bool:
 
 def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> Dict[str, Any]:
     """
-    Queries Neo4j to inspect:
+    Queries Neo4j to dynamically inspect:
     - Total row count
     - Unique property keys present on (:Row) nodes
     - Available (:Dataset) nodes
-    Handles arbitrary dynamic CSV columns. Differentiates connection errors from empty graph.
+    - Active dataset (most recent)
+    Handles arbitrary dynamic CSV columns and stripped UTF-8 BOM.
     """
-    schema = {
+    schema: Dict[str, Any] = {
         "empty": True,
         "total_rows": 0,
         "properties": [],
         "property_map": {},  # lowercase -> actual property name
         "datasets": [],
+        "active_dataset": None,
+        "numeric_columns": set(),
         "error": None
     }
     
@@ -133,7 +139,20 @@ def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> D
                     
                 schema["empty"] = False
                 
-                # 2. Extract property keys from sample rows
+                # 2. Extract datasets (most recent first)
+                try:
+                    dataset_res = session.run(
+                        "MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename, d.uploaded_at AS uploaded_at "
+                        "ORDER BY d.uploaded_at DESC LIMIT 10"
+                    )
+                    datasets = [d.data() for d in dataset_res]
+                    schema["datasets"] = datasets
+                    if datasets:
+                        schema["active_dataset"] = datasets[0]
+                except Exception as ex_ds:
+                    logger.debug(f"Dataset node introspection note: {ex_ds}")
+                
+                # 3. Extract property keys from sample rows
                 keys_res = session.run("MATCH (r:Row) RETURN keys(r) AS keys LIMIT 50")
                 prop_set = set()
                 for rec in keys_res:
@@ -152,9 +171,29 @@ def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> D
                         prop_map[clean_p.lower()] = p
                 schema["property_map"] = prop_map
                 
-                # 3. Extract datasets
-                dataset_res = session.run("MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename ORDER BY d.uploaded_at DESC LIMIT 10")
-                schema["datasets"] = [d.data() for d in dataset_res]
+                # 4. Inspect sample rows to identify numeric columns
+                try:
+                    sample_res = session.run("MATCH (r:Row) RETURN r LIMIT 10")
+                    num_cols = set()
+                    for s_rec in sample_res:
+                        row_dict = s_rec.get("r")
+                        if isinstance(row_dict, dict):
+                            for k, v in row_dict.items():
+                                if k in ("dataset_id", "row_index"):
+                                    continue
+                                if isinstance(v, (int, float)):
+                                    num_cols.add(k)
+                                elif isinstance(v, str):
+                                    v_clean = v.replace(",", "").strip()
+                                    try:
+                                        float(v_clean)
+                                        num_cols.add(k)
+                                    except ValueError:
+                                        pass
+                    schema["numeric_columns"] = num_cols
+                except Exception as ex_num:
+                    logger.debug(f"Numeric type detection note: {ex_num}")
+
                 schema["error"] = None
                 return schema
         except Exception as e:
@@ -167,11 +206,14 @@ def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> D
 
 
 # -----------------------------------------------------------------------------
-# 3. DYNAMIC COLUMN MATCHING & QUESTION -> CYPHER TEMPLATES
+# 3. DYNAMIC COLUMN MATCHING & CYPHER UTILITIES
 # -----------------------------------------------------------------------------
 
 def escape_prop(col: str) -> str:
-    """Format property name for Cypher: simple alphanumeric identifiers stay unquoted, otherwise wrap in backticks."""
+    """
+    Format property name for Cypher: simple alphanumeric identifiers stay unquoted,
+    otherwise safely wrap in backticks.
+    """
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col):
         return col
     return f"`{col}`"
@@ -179,7 +221,7 @@ def escape_prop(col: str) -> str:
 
 def get_column_variants(prop: str) -> List[str]:
     """
-    Generates likely natural language variations of a column name.
+    Generates natural language variations of a column name.
     e.g. 'group' -> ['group', 'groups']
          'first_name' -> ['first_name', 'first name', 'firstname']
          'category' -> ['category', 'categories']
@@ -207,17 +249,15 @@ def get_column_variants(prop: str) -> List[str]:
         else:
             variants.append(p + "s")
 
-    # Remove duplicates preserving order
     return list(dict.fromkeys(variants))
 
 
 def find_column_in_question(question: str, property_map: Dict[str, str]) -> Optional[str]:
     """
     Identifies if a question references any known column in property_map.
-    Supports arbitrary dynamic CSV column names, singular/plural, and space-separated variants.
+    Supports dynamic CSV column names, singular/plural, and space-separated variants.
     """
     q_lower = question.lower()
-    # Sort actual properties by length descending to prevent partial substring matches
     sorted_props = sorted(property_map.items(), key=lambda x: len(x[0]), reverse=True)
     for prop_key, actual_name in sorted_props:
         if prop_key in ("row_index", "dataset_id"):
@@ -239,14 +279,13 @@ def extract_filter_value(question: str, col_name: str) -> Optional[str]:
       - 'where group = Billing.' -> 'Billing'
       - 'with status = "active"' -> 'active'
     """
-    col_esc = re.escape(col_name)
     variants = get_column_variants(col_name)
     col_group = "(?:" + "|".join(re.escape(v) for v in variants) + ")"
 
     patterns = [
-        # "belong to the Billing group" / "belong to Billing group"
+        # "belong to the Billing group" / "in Billing group"
         rf"(?:belong(?:s)?\s+to(?: the)?|in(?: the)?)\s+['\"]?([^'\"]+?)['\"]?\s+{col_group}\b",
-        # "where group equal to Billing" / "where group = Billing" / "group is active"
+        # "where group equal to Billing" / "group = Billing" / "group is active"
         rf"\b{col_group}\s*(?:equal\s+to|equals?|=|is|are|of|:)\s*['\"]?([^'\"?.,;]+)[\'\"]?",
         # "status active" (e.g. "with status active")
         rf"\b{col_group}\s+['\"]?([a-zA-Z0-9_-]+)[\'\"]?",
@@ -272,7 +311,81 @@ def extract_filter_value(question: str, col_name: str) -> Optional[str]:
     return None
 
 
-def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool]:
+def extract_limit(question: str, default: int = 5) -> int:
+    """Extracts explicit row count limit if requested (e.g. 'show first 10 rows'), bounded [1, 50]."""
+    m = re.search(r"\b(?:first\s+|top\s+)?(\d+)\s+(?:rows?|records?|items?|entries)\b", question.lower())
+    if m:
+        try:
+            val = int(m.group(1))
+            return min(max(val, 1), 50)
+        except ValueError:
+            pass
+    return default
+
+
+def detect_numeric_aggregation(question: str) -> Optional[str]:
+    """Detects numeric aggregation intent: max, min, avg, or sum."""
+    q = question.lower()
+    if re.search(r"\b(max(?:imum)?|highest|top|most)\b", q):
+        return "max"
+    if re.search(r"\b(min(?:imum)?|lowest|bottom|least)\b", q):
+        return "min"
+    if re.search(r"\b(avg|average|mean)\b", q):
+        return "avg"
+    if re.search(r"\b(sum|total\s+sum|sum\s+of)\b", q):
+        return "sum"
+    return None
+
+
+def detect_string_search(question: str) -> Optional[str]:
+    """Detects text search queries (e.g. rows containing 'security' or which mention Kafka)."""
+    q = question.strip()
+    m = re.search(r"\b(?:contain(?:s|ing)?|mention(?:s|ed|ing)?|with\s+text|matching)\s+['\"]([^'\"]+)['\"]", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"\b(?:contain(?:s|ing)?|mention(?:s|ed|ing)?)\s+([a-zA-Z0-9_-]+)\b", q, re.IGNORECASE)
+    if m2:
+        val = m2.group(1).strip()
+        if val.lower() not in {"the", "a", "an", "all", "rows", "records", "data"}:
+            return val
+    return None
+
+
+def detect_unknown_property_candidate(q_lower: str) -> Optional[str]:
+    """
+    Identifies candidate property names in user questions when no known column matched.
+    Enables precise, honest feedback: "I don't have a column named '<candidate>' in the uploaded data."
+    """
+    patterns = [
+        # breakdown by salary / distribution by department
+        r"\b(?:breakdown|distribution)\s+by\s+([a-zA-Z0-9_-]+)\b",
+        # what values are in location / unique departments
+        r"\bvalues?\s+(?:are\s+)?(?:in|for|present\s+in)\s+([a-zA-Z0-9_-]+)\b",
+        r"\b(?:unique|distinct)\s+([a-zA-Z0-9_-]+)\b",
+        # where blue_hair / with green_eyes / have blue_hair
+        r"\b(?:where|with|have|has|equals?|equal\s+to)\s+([a-zA-Z0-9_-]+)\b",
+        # maximum age / average salary
+        r"\b(?:max(?:imum)?|min(?:imum)?|average|avg|mean|highest|lowest)\s+([a-zA-Z0-9_-]+)\b"
+    ]
+    stop_words = {"the", "a", "an", "all", "rows", "records", "data", "count", "number", "dataset"}
+    for pat in patterns:
+        m = re.search(pat, q_lower)
+        if m:
+            cand = m.group(1).strip()
+            if cand not in stop_words:
+                return cand
+    return None
+
+
+# -----------------------------------------------------------------------------
+# 4. QUESTION -> CYPHER TEMPLATE GENERATOR
+# -----------------------------------------------------------------------------
+
+def generate_cypher_template(
+    question: str,
+    schema: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[str], Optional[str], bool]:
     """
     Maps user question to a safe Cypher query and metadata.
     Returns: (cypher_query, query_type, is_grounded)
@@ -284,40 +397,112 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
     q_lower = q_clean.lower()
     prop_map = schema.get("property_map", {})
 
-    # 0. Identify dynamic column from question if present
+    # 0. Identify dynamic column from question or conversation context
     col = find_column_in_question(q_clean, prop_map)
+    
+    # Conversational follow-up resolution (e.g. "how many of them are in Billing?")
+    if not col and context and context.get("last_column"):
+        if re.search(r"\b(of\s+them|in\s+it|for\s+that|about\s+it)\b", q_lower) or re.search(r"\b(belong|in|with|having)\b", q_lower):
+            col = context.get("last_column")
 
     # 1. Column count intent
     # e.g., "How many columns?", "How many columns are there?", "What is the column count?", "Tell me the number of columns", "Number of columns", "Count columns"
-    if re.search(r"\b(how\s+many\s+(?:total\s+)?columns?|column\s+count|number\s+of\s+columns?|count\s+columns?|total\s+columns?)\b", q_lower):
-        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+    if re.search(r"\b(how\s+many\s+(?:total\s+)?colum(?:n)?s?|what\s+is\s+(?:the\s+)?(?:number\s+of\s+|total\s+)?colum(?:n)?s?|what\s+is\s+(?:the\s+)?colum(?:n)?\s+count|colum(?:n)?\s+count|number\s+of\s+colum(?:n)?s?|count\s+colum(?:n)?s?|total\s+colum(?:n)?s?)\b", q_lower):
+        cypher = (
+            "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 "
+            "MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) "
+            "WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item "
+            "WITH d, collect(DISTINCT key_item) AS all_keys "
+            "WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns "
+            "RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+        )
         return cypher, "column_count", True
 
     # 2. Schema info / column listing
     # e.g., "What columns are available?", "List the columns.", "Show me the column names.", "List available columns.", "What are the columns?", "Show schema", "What fields exist?"
-    if re.search(r"\b(what\s+columns|list\s+(?:the\s+)?columns?|available\s+columns|show\s+(?:me\s+)?(?:the\s+)?column\s+names?|column\s+names?|what\s+are\s+the\s+columns|columns?\s+available|show\s+schema|what\s+fields)\b", q_lower):
-        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+    if re.search(r"\b(what\s+colum(?:n)?s?|list\s+(?:the\s+)?colum(?:n)?s?|available\s+colum(?:n)?s?|show\s+(?:me\s+)?(?:the\s+)?colum(?:n)?\s+names?|colum(?:n)?\s+names?|what\s+are\s+the\s+colum(?:n)?s?|colum(?:n)?s?\s+available|show\s+schema|what\s+fields|what\s+headers|headers)\b", q_lower):
+        cypher = (
+            "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 "
+            "MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) "
+            "WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item "
+            "WITH d, collect(DISTINCT key_item) AS all_keys "
+            "WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns "
+            "RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+        )
         return cypher, "schema_info", True
 
-    # 3. Dataset summary / overview
+    # 3. String Search / Substring Matching — MUST run before dataset summary to avoid "contains <value>" being swallowed
+    # e.g., "Find rows containing 'security'", "Show records where status contains 'active'", "Which rows mention Kafka?"
+    search_term = detect_string_search(q_clean)
+    if search_term:
+        safe_term = search_term.replace("'", "\\'")
+        if col:
+            prop = escape_prop(col)
+            cypher = f"MATCH (r:Row) WHERE toLower(toString(r.{prop})) CONTAINS toLower('{safe_term}') RETURN r LIMIT 10"
+        else:
+            cypher = f"MATCH (r:Row) WHERE any(k IN keys(r) WHERE toLower(toString(r[k])) CONTAINS toLower('{safe_term}')) RETURN r LIMIT 10"
+        return cypher, "string_search", True
+
+    # 4. Dataset summary / overview (only when not a string search)
     # e.g., "What is the content?", "What does this dataset contain?", "Tell me about this file.", "Tell me about the uploaded dataset.", "Give me a summary of the uploaded data."
-    if re.search(r"\b(content|contain(?:s)?|about this file|about the (?:uploaded )?dataset|about the data|what\s+is\s+in\s+this\s+dataset|what\s+is\s+in\s+the\s+dataset|summary of the (?:uploaded )?data|summar(?:y|ize)|overview|describe the (?:data|dataset))\b", q_lower):
-        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, count(r) AS total_rows, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, total_rows, all_rows, collect(DISTINCT key_item) AS all_keys WITH d, total_rows, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns, all_rows[0..3] AS sample_rows RETURN coalesce(d.filename, 'uploaded dataset') AS filename, total_rows, size(columns) AS column_count, columns, sample_rows"
+    if re.search(r"\b(content|contain(?:s)?|about this file|about the (?:uploaded )?dataset|about the data|what\s+is\s+in\s+this\s+dataset|what\s+is\s+in\s+the\s+dataset|summary of the (?:uploaded )?data|summar(?:y|ize)|overview|describe the (?:data|dataset)|what\s+kind\s+of\s+data)\b", q_lower):
+        cypher = (
+            "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 "
+            "MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) "
+            "WITH d, count(r) AS total_rows, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item "
+            "WITH d, total_rows, all_rows, collect(DISTINCT key_item) AS all_keys "
+            "WITH d, total_rows, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns, all_rows[0..3] AS sample_rows "
+            "RETURN coalesce(d.filename, 'uploaded dataset') AS filename, total_rows, size(columns) AS column_count, columns, sample_rows"
+        )
         return cypher, "dataset_summary", True
 
-    # 4. Unrecognized property filter check:
+    # 5. Multi-Condition Queries (e.g. "How many Billing records are Open?", "Show rows where department is HR and status is Active")
+    if " and " in q_lower or "," in q_lower:
+        clauses = [c.strip() for c in q_clean.replace(",", " and ").split(" and ") if c.strip()]
+        conds = []
+        for clause in clauses:
+            c_col = find_column_in_question(clause, prop_map)
+            if c_col:
+                c_val = extract_filter_value(clause, c_col)
+                if c_val:
+                    conds.append((c_col, c_val))
+        if len(conds) >= 2:
+            where_parts = []
+            for c_col, c_val in conds:
+                safe_v = c_val.replace("'", "\\'")
+                where_parts.append(f"r.{escape_prop(c_col)} = '{safe_v}'")
+            where_clause = " AND ".join(where_parts)
+            if re.search(r"\b(how\s+many|count|number\s+of)\b", q_lower):
+                cypher = f"MATCH (r:Row) WHERE {where_clause} RETURN count(r)"
+                return cypher, "multi_condition_count", True
+            else:
+                cypher = f"MATCH (r:Row) WHERE {where_clause} RETURN r LIMIT 10"
+                return cypher, "multi_condition_rows", True
+
+
+    # 6. Numeric Aggregation (Min / Max / Average / Sum)
+    # e.g., "What is the maximum amount?", "average score", "minimum age", "sum of amount"
+    num_agg = detect_numeric_aggregation(q_clean)
+    if num_agg and col:
+        prop = escape_prop(col)
+        cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN avg(toFloat(r.{prop})) AS avg_val, min(toFloat(r.{prop})) AS min_val, max(toFloat(r.{prop})) AS max_val, sum(toFloat(r.{prop})) AS sum_val"
+        return cypher, f"numeric_{num_agg}", True
+
+    # 7. Unrecognized property filter check:
     # If col was NOT found, but the question attempts to filter/condition ("where", "with", "have", "blue_hair", "green_eyes", etc.),
     # reject immediately to prevent ungrounded queries from falling through to general row count.
-    if not col and re.search(r"\b(belong(?:s)?\s+to|where|with|have|has|equals?|equal\s+to|\bfor\s+each\b|\bper\b)\b", q_lower):
-        return None, "unknown_property", False
+    if not col:
+        cand = detect_unknown_property_candidate(q_lower)
+        if cand or re.search(r"\b(belong(?:s)?\s+to|where|with|have|has|equals?|equal\s+to|\bfor\s+each\b|\bper\b)\b", q_lower):
+            return None, "unknown_property", False
 
-    # 5. Breakdown by column (e.g., "Give me a breakdown by group.", "How many rows are in each group?", "Breakdown by department")
+    # 8. Breakdown by column (e.g., "Give me a breakdown by group.", "How many rows are in each group?", "Breakdown by department")
     if col and re.search(r"\b(breakdown|per|by|distribution|each)\b", q_lower):
         prop = escape_prop(col)
         cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r.{prop} AS {prop}, count(r) AS count ORDER BY count DESC LIMIT 20"
         return cypher, "group_breakdown", True
 
-    # 6. Distinct values / categories query
+    # 9. Distinct values / categories query
     # e.g., "What values are in group?", "List unique group values.", "What groups are present?"
     if col and re.search(r"\b(distinct|unique|values|present|exist|available|what\s+[a-z_0-9-]+\s+(?:are|exist|is)|list\s+all|show\s+all|categories)\b", q_lower):
         if not re.search(r"\b(how\s+many\s+rows|count\s+rows|number\s+of\s+rows)\b", q_lower):
@@ -325,7 +510,7 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
             cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN DISTINCT r.{prop} AS {prop} ORDER BY {prop} LIMIT 25"
             return cypher, "distinct_values", True
 
-    # 7. Row listing / preview of specific rows
+    # 10. Row listing / preview of specific rows
     # e.g., "Show the rows where group is Billing.", "Show rows with status active"
     if col and re.search(r"\b(show|list|display|find|get|see|view|preview)\b.*\b(rows?|records?)\b", q_lower):
         val = extract_filter_value(q_clean, col)
@@ -338,7 +523,7 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
             cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r LIMIT 10"
             return cypher, "filtered_rows", True
 
-    # 8. Filtered count queries
+    # 11. Filtered count queries
     # e.g., "How many rows have group equal to Billing?", "Count rows where group = Billing.", "How many rows belong to the Billing group?"
     if col and re.search(r"\b(how\s+many\s+rows|count\s+rows|number\s+of\s+rows|how\s+many\s+records)\b", q_lower):
         val = extract_filter_value(q_clean, col)
@@ -351,24 +536,32 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
             cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r.{prop} AS {prop}, count(r) AS count ORDER BY count DESC LIMIT 20"
             return cypher, "group_breakdown", True
 
-    # 9. Total row count query (genuine total count across whole dataset)
+    # 12. Total row count query (genuine total count across whole dataset)
     # e.g., "How many rows are there?", "How many rows?", "What is the number of rows?", "What is the row count?", "Tell me how many records are there"
     if re.search(r"\b(how\s+many\s+(?:total\s+)?(?:rows|records)|what\s+is\s+the\s+(?:number\s+of\s+rows|row\s+count)|number\s+of\s+rows|row\s+count|total\s+(?:number\s+of\s+)?rows|count\s+(?:total\s+)?rows|total\s+records)\b", q_lower):
         cypher = "MATCH (r:Row) RETURN count(r)"
         return cypher, "total_count", True
 
-    # 10. Generic preview / list rows (when no column is specified)
+    # 13. Generic preview / list rows (when no column is specified)
     # e.g., "Show me some rows.", "Show first 5 rows.", "Give me a sample of the data.", "Preview data"
     if re.search(r"\b(preview|show|list|display|sample|view)\b.*\b(rows?|records?|data)\b", q_lower):
-        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) RETURN r LIMIT 5"
+        limit_val = extract_limit(q_clean, default=5)
+        cypher = f"OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) RETURN r LIMIT {limit_val}"
         return cypher, "preview_rows", True
 
-    # 11. General columns fallback
-    if re.search(r"\b(columns?|fields?|schema|properties|headers?)\b", q_lower):
-        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+    # 14. General columns fallback (typo-tolerant)
+    if re.search(r"\b(colum(?:n)?s?|fields?|schema|properties|headers?)\b", q_lower):
+        cypher = (
+            "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 "
+            "MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) "
+            "WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item "
+            "WITH d, collect(DISTINCT key_item) AS all_keys "
+            "WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns "
+            "RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+        )
         return cypher, "schema_info", True
 
-    # 12. Dataset listing
+    # 15. Dataset listing
     if re.search(r"\b(datasets|files|uploaded|filename)\b", q_lower):
         cypher = "MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename, d.uploaded_at AS uploaded_at"
         return cypher, "dataset_info", True
@@ -378,7 +571,7 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
 
 
 # -----------------------------------------------------------------------------
-# 4. ANSWER SYNTHESIS (STRICT GROUNDING ON NEO4J RESULTS)
+# 5. ANSWER SYNTHESIS (STRICT GROUNDING ON NEO4J RESULTS)
 # -----------------------------------------------------------------------------
 
 def format_answer_from_result(
@@ -389,14 +582,16 @@ def format_answer_from_result(
     schema: Dict[str, Any]
 ) -> Tuple[str, bool]:
     """
-    Synthesizes a truthful, concise human-readable answer strictly from the query result.
-    Never fabricates missing details.
+    Synthesizes honest natural language response based STRICTLY on Neo4j query result.
     Returns: (answer_text, is_grounded)
     """
-    if not result and query_type not in ("filtered_count", "total_count"):
-        return "No matching rows found in the uploaded data.", False
+    if query_type in ("unsupported", "unknown_property"):
+        cand = detect_unknown_property_candidate(question.lower())
+        if cand:
+            return f"I don't have that information in the uploaded data. No column named '{cand}' was found in the schema.", False
+        return "I don't have that information in the uploaded data.", False
 
-    # 1. Total row count
+    # 1. Total count
     if query_type == "total_count":
         cnt = None
         fn = None
@@ -421,6 +616,8 @@ def format_answer_from_result(
         m = re.search(r"\{`?([^`:]+)`?:\s*'([^']+)'\}", cypher)
         if m:
             col, val = m.group(1).lstrip("\ufeff"), m.group(2)
+            GLOBAL_CHAT_CONTEXT["last_column"] = col
+            GLOBAL_CHAT_CONTEXT["last_value"] = val
             return f"There are {cnt} rows where {col} = '{val}'.", True
         return f"Found {cnt} matching rows.", True
 
@@ -430,6 +627,7 @@ def format_answer_from_result(
         if keys:
             raw_col = keys[0]
             col_disp = raw_col.lstrip("\ufeff")
+            GLOBAL_CHAT_CONTEXT["last_column"] = col_disp
             vals = [str(r[raw_col]) for r in result if r.get(raw_col) is not None and str(r.get(raw_col)).strip()]
             if not vals:
                 return f"No values found for {col_disp}.", False
@@ -446,6 +644,8 @@ def format_answer_from_result(
         m = re.search(r"\{`?([^`:]+)`?:\s*'([^']+)'\}", cypher)
         if m:
             col, val = m.group(1).lstrip("\ufeff"), m.group(2)
+            GLOBAL_CHAT_CONTEXT["last_column"] = col
+            GLOBAL_CHAT_CONTEXT["last_value"] = val
             return f"Found {count} matching row(s) where {col} = '{val}'. Showing properties in result.", True
         return f"Found {count} matching row(s). Showing properties in result.", True
 
@@ -468,6 +668,7 @@ def format_answer_from_result(
             cnt = r.get("count", 0)
             val_disp = str(val) if str(val).strip() else "(empty)"
             lines.append(f"{val_disp}: {cnt}")
+        GLOBAL_CHAT_CONTEXT["last_column"] = col_name
         summary = "; ".join(lines)
         return f"Breakdown by {col_name}: {summary}.", True
 
@@ -522,7 +723,39 @@ def format_answer_from_result(
             return f"The uploaded dataset '{filename}' contains {total:,} rows across {cnt} columns.", True
         return "No dataset information found in graph.", False
 
-    # 10. Dataset info
+    # 10. Numeric Aggregations (min, max, avg, sum)
+    if query_type.startswith("numeric_"):
+        op = query_type.split("_")[1]
+        if result:
+            rec = result[0]
+            val = rec.get(f"{op}_val")
+            if val is not None:
+                if isinstance(val, float):
+                    val_str = f"{val:,.2f}" if not val.is_integer() else f"{int(val):,}"
+                else:
+                    val_str = f"{val:,}"
+                return f"The {op} value in the uploaded data is {val_str}.", True
+        return "Unable to compute numeric aggregation on this column.", False
+
+    # 11. String search
+    if query_type == "string_search":
+        count = len(result)
+        if count == 0:
+            return "No matching rows found containing the requested text.", True
+        return f"Found {count} matching row(s) containing the search text.", True
+
+    # 12. Multi-condition queries
+    if query_type == "multi_condition_count":
+        cnt = result[0].get("count(r)", 0) if result else 0
+        return f"There are {cnt} rows matching all specified conditions.", True
+
+    if query_type == "multi_condition_rows":
+        count = len(result)
+        if count == 0:
+            return "No matching rows found for the specified conditions.", False
+        return f"Found {count} matching row(s) for the specified conditions. Showing properties in result.", True
+
+    # 13. Dataset info
     if query_type == "dataset_info":
         if result:
             filenames = [d.get("filename", "unknown") for d in result]
@@ -533,13 +766,14 @@ def format_answer_from_result(
 
 
 # -----------------------------------------------------------------------------
-# 5. PUBLIC CHAT ENTRYPOINT
+# 6. PUBLIC CHAT ENTRYPOINT
 # -----------------------------------------------------------------------------
 
 def handle_chat(
     question: str,
     driver: Any,
-    database: Optional[str] = "CSV_Graph_DB"
+    database: Optional[str] = "CSV_Graph_DB",
+    context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Main Chat API handler complying with the hackathon handout specification.
@@ -548,6 +782,7 @@ def handle_chat(
       - question: User's English natural language question.
       - driver: Neo4j Python GraphDatabase driver instance (or compatible mock).
       - database: Target Neo4j database name (defaults to 'CSV_Graph_DB').
+      - context: Optional conversation context dict for multi-turn conversational follow-ups.
 
     Returns:
       {
@@ -557,6 +792,8 @@ def handle_chat(
         "grounded": bool
       }
     """
+    active_ctx = context or GLOBAL_CHAT_CONTEXT
+
     # 1. Validate question existence
     if not question or not str(question).strip():
         return {
@@ -595,11 +832,16 @@ def handle_chat(
         }
 
     # 4. Map question to Cypher query template
-    cypher, query_type, supported = generate_cypher_template(question, schema)
+    cypher, query_type, supported = generate_cypher_template(question, schema, context=active_ctx)
 
     if not supported or not cypher:
+        cand = detect_unknown_property_candidate(question.lower())
+        if cand:
+            msg = f"I don't have that information in the uploaded data. No column named '{cand}' was found in the schema."
+        else:
+            msg = "I don't have that information in the uploaded data."
         return {
-            "answer": "I don't have that information in the uploaded data.",
+            "answer": msg,
             "cypher": "",
             "result": [],
             "grounded": False
@@ -627,7 +869,7 @@ def handle_chat(
             raw_results = [record.data() for record in db_res]
     except Exception as e:
         logger.warning(f"Neo4j execution failed for query '{cypher}': {e}")
-        # If database name was wrong, attempt fallback to default session
+        # Fallback to default session if named database was not found
         if database:
             try:
                 with driver.session() as session:
