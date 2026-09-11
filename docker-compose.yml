@@ -77,10 +77,11 @@ services:
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=csvgraphdb
       - NEO4J_DATABASE=CSV_Graph_DB
+      - JOB_STATE_FILE=/app/.state/jobs.json
     ports:
-      - "5000:5000"
+      - "8000:5000"
     volumes:
-      - job_state:/app/.state
+      - ./.state:/app/.state
     depends_on:
       kafka:
         condition: service_healthy
@@ -105,8 +106,9 @@ services:
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=csvgraphdb
       - NEO4J_DATABASE=CSV_Graph_DB
+      - JOB_STATE_FILE=/app/.state/jobs.json
     volumes:
-      - job_state:/app/.state
+      - ./.state:/app/.state
     depends_on:
       kafka:
         condition: service_healthy
@@ -138,4 +140,3 @@ networks:
 volumes:
   neo4j_data:
   kafka_data:
-  job_state:

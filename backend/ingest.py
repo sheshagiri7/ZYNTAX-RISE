@@ -103,6 +103,10 @@ def process_csv_upload(file_storage: FileStorage) -> Tuple[Dict[str, Any], int]:
         except Exception:
             return {"error": "Unable to decode CSV text. Ensure file is UTF-8 encoded."}, 400
 
+    # 5b. Detect hostile/malformed content (null bytes)
+    if "\0" in content_text:
+        return {"error": "Malformed CSV structure: file contains null bytes."}, 400
+
     # 6. Parse CSV rows
     try:
         stream = io.StringIO(content_text.strip())
