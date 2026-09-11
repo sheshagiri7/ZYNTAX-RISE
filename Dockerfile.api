@@ -1,0 +1,29 @@
+# Production Dockerfile for ZYNTAX API Service
+# Pinned Python 3.11 runtime
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Ensure non-buffered python output for clean container logging
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install dependencies as root
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source code
+COPY . .
+
+# Create non-root user for security
+RUN useradd -m -u 1001 appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+# Expose API port
+EXPOSE 5000
+
+# Start Flask backend API
+CMD ["python", "app.py"]
