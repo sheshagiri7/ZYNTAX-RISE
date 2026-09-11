@@ -2,10 +2,11 @@
 CSV Ingestion & Validation Module for ZYNTAX Pipeline
 =====================================================
 Handles:
-- File validation (rejects non-CSV, rejects empty files, handles headers-only)
+- File validation (rejects non-CSV, rejects empty files, handles headers-only, ragged lines)
 - Deterministic dataset_id calculation based on SHA256 of CSV content
 - Publishing one Kafka message per row with dataset_id and row_index
 - Decoupled from Neo4j (never writes directly from upload handler to Neo4j)
+- Fails cleanly with HTTP 503 if Kafka is not ready (no fake 'complete' or stack traces)
 """
 
 import io
@@ -13,10 +14,10 @@ import csv
 import time
 import hashlib
 import logging
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any
 from werkzeug.datastructures import FileStorage
 from backend.config import KAFKA_TOPIC
-from backend.kafka_client import publish_row_message, flush_producer
+from backend.kafka_client import publish_row_message, flush_producer, is_kafka_connected, get_producer
 from backend.job_tracker import tracker
 
 logger = logging.getLogger("zyntax.ingest")
@@ -132,10 +133,20 @@ def process_csv_upload(file_storage: FileStorage) -> Tuple[Dict[str, Any], int]:
         return {
             "job_id": job_id,
             "rows_received": 0,
-            "status": "complete"
+            "status": "queued"
         }, 202
 
-    # 7. Create job in tracker
+    # 7. Check Kafka readiness before accepting job
+    # Prevents false 'complete' or broken promises if Kafka is down
+    if not is_kafka_connected():
+        p = get_producer(retries=2, delay=0.5)
+        if p is None:
+            logger.error("Rejecting CSV upload: Kafka is unreachable.")
+            return {
+                "error": "Message broker (Kafka) is not ready. Ingestion rejected cleanly without data loss."
+            }, 503
+
+    # 8. Create job in tracker
     tracker.create_job(
         job_id=job_id,
         dataset_id=dataset_id,
@@ -143,8 +154,8 @@ def process_csv_upload(file_storage: FileStorage) -> Tuple[Dict[str, Any], int]:
         rows_total=rows_total
     )
 
-    # 8. Publish one Kafka message per row
-    # Required fields in each message: job_id, dataset_id, row_index, data
+    # 9. Publish one Kafka message per row
+    published_count = 0
     for idx, raw_row in enumerate(rows):
         cleaned = clean_row_values(raw_row)
         message = {
@@ -155,17 +166,24 @@ def process_csv_upload(file_storage: FileStorage) -> Tuple[Dict[str, Any], int]:
             "data": cleaned,
             "timestamp": time.time()
         }
-        # Use dataset_id as partition key to preserve ordering per dataset
-        publish_row_message(
+        ok = publish_row_message(
             topic=KAFKA_TOPIC,
             message=message,
             key=f"{dataset_id}:{idx + 1}"
         )
+        if ok:
+            published_count += 1
 
     # Flush Kafka producer buffer
     flush_producer()
 
-    logger.info(f"Published {rows_total} rows for job {job_id} (dataset: {dataset_id}) to Kafka topic '{KAFKA_TOPIC}'")
+    if published_count == 0:
+        tracker.set_status(job_id, "failed")
+        return {
+            "error": "Message broker (Kafka) unavailable: failed to dispatch row messages."
+        }, 503
+
+    logger.info(f"Published {published_count}/{rows_total} rows for job {job_id} (dataset: {dataset_id}) to Kafka topic '{KAFKA_TOPIC}'")
 
     # Contract requirement: 202 Accepted
     return {
