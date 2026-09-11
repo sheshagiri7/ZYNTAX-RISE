@@ -1,5 +1,0 @@
-group,status,amount,department
-Billing,active,100,Finance
-Billing,pending,250,Finance
-Engineering,active,300,Tech
-Marketing,inactive,150,Growth

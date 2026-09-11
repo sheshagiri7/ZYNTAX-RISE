@@ -143,9 +143,8 @@ All Q&A pairs below were run live against `http://localhost:3000/chat` with `sam
 
 > **Test suite summary (automated + live):**
 > - `test_pipeline.py`: **16/16 PASS** (ingestion, idempotency, Kafka, Neo4j)
-> - `test_chat_engine.py`: **14/14 PASS** (unit tests, mocked Neo4j)
+> - `test_chat_engine.py`: **14/14 PASS** (unit tests, dynamic schema, mocked Neo4j)
 > - `test_endpoint.py`: **7/7 PASS** (Flask test client, HTTP surface)
-> - `test_multi_schema.py`: **30/30 PASS** (3 CSV schemas × 10 scenarios each)
 > - **Live Docker API** (`localhost:3000`): **14/14 PASS** (real queries against running containers)
 
 ---
@@ -214,7 +213,6 @@ docker compose up --build -d
 python3 test_pipeline.py       # 16/16 — ingestion, idempotency, Kafka, Neo4j
 python3 test_chat_engine.py    # 14/14 — chatbot unit tests (mocked Neo4j)
 python3 test_endpoint.py       # 7/7  — HTTP endpoint tests (Flask test client)
-python3 test_multi_schema.py   # 30/30 — multi-schema dynamic CSV adaptation
 ```
 
 ### Teardown

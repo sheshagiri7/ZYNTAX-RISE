@@ -43,3 +43,5 @@ out/
 *.swp
 *.swo
 test_data.csv
+*.csv
+*.pdf

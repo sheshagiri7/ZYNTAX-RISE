@@ -131,7 +131,7 @@ Run the complete test suite locally:
 # 1. Pipeline and hostile inputs test suite (16 tests)
 python3 test_pipeline.py
 
-# 2. Chatbot verification and read-only safety guardrails (12 scenarios)
+# 2. Chatbot verification and read-only safety guardrails (14 scenarios)
 python3 test_chat_engine.py
 
 # 3. Live Flask endpoint integration tests (7 tests)
