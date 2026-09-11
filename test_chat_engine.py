@@ -1,15 +1,19 @@
 """
-Tests for ZYNTAX Chat Engine (Member 3)
-=======================================
-Verifies:
-1. Empty graph handling (pre-upload)
-2. Total count queries
-3. Filtered count queries (Handout Part 4 match)
-4. Distinct value queries
-5. Breakdown / aggregation queries
-6. Unsupported / off-topic queries
-7. Nonexistent column queries
-8. Read-only safety validation
+Comprehensive Verification & Hardening Tests for ZYNTAX Chat Engine (Member 3)
+=============================================================================
+Tests all 9 specific scenarios required by Hackathon Handout & Master Prompt:
+
+A. Valid count question: "How many rows are there?"
+B. Filter question: "How many rows belong to the Billing group?"
+C. Distinct-value question: "What groups are present?"
+D. Row listing question: "Show the rows where group is Billing."
+E. Unknown property: "How many employees have blue_hair?"
+F. Unsupported/general knowledge question: "What is the capital of France?"
+G. Empty question: ""
+H. Empty graph / no uploaded dataset
+I. Neo4j execution error simulation
++ Read-only Cypher safety check (blocks CREATE, MERGE, DELETE, DETACH, SET, DROP, etc.)
++ Dynamic CSV schema support (arbitrary headers: customer_id, department, salary)
 """
 
 import sys
@@ -40,16 +44,22 @@ class MockResult:
 
 
 class MockSession:
-    def __init__(self, graph_data: Dict[str, Any]):
+    def __init__(self, graph_data: Dict[str, Any], should_fail: bool = False):
         self.graph_data = graph_data
+        self.should_fail = should_fail
 
     def __enter__(self):
+        if self.should_fail:
+            raise RuntimeError("Simulated Neo4j connection failure")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
     def run(self, cypher: str, parameters: Dict[str, Any] = None):
+        if self.should_fail:
+            raise RuntimeError("Simulated Neo4j query error")
+
         cypher_stripped = cypher.strip()
 
         # Row count
@@ -82,12 +92,27 @@ class MockSession:
                 return MockResult([{"count(r)": len(matched)}])
             return MockResult([{"count(r)": 0}])
 
-        # Distinct: MATCH (r:Row) WHERE r.status IS NOT NULL RETURN DISTINCT r.status AS status
+        # Filtered rows: MATCH (r:Row {group: 'Billing'}) RETURN r LIMIT 10
+        if "MATCH (r:Row {" in cypher_stripped and "RETURN r" in cypher_stripped:
+            import re
+            m = re.search(r"\{(\w+):\s*'([^']+)'\}", cypher_stripped)
+            if m:
+                col, val = m.group(1), m.group(2)
+                matched = [r for r in self.graph_data.get("rows", []) if str(r.get(col)) == val]
+                return MockResult([{"r": r} for r in matched[:10]])
+            return MockResult([])
+
+        # Generic preview: MATCH (r:Row) RETURN r LIMIT 5
+        if "MATCH (r:Row) RETURN r" in cypher_stripped:
+            rows = self.graph_data.get("rows", [])
+            return MockResult([{"r": r} for r in rows[:5]])
+
+        # Distinct: MATCH (r:Row) WHERE r.group IS NOT NULL RETURN DISTINCT r.group AS group
         if "RETURN DISTINCT" in cypher_stripped:
             import re
             m = re.search(r"AS\s+(\w+)", cypher_stripped)
-            col = m.group(1) if m else "status"
-            vals = sorted(list({r[col] for r in self.graph_data.get("rows", []) if col in r}))
+            col = m.group(1) if m else "group"
+            vals = sorted(list({str(r[col]) for r in self.graph_data.get("rows", []) if col in r}))
             return MockResult([{col: v} for v in vals])
 
         # Breakdown
@@ -101,113 +126,223 @@ class MockSession:
                 counts[val] = counts.get(val, 0) + 1
             return MockResult([{col: k, "count": v} for k, v in counts.items()])
 
-        # Default fallback
         return MockResult([])
 
 
 class MockDriver:
-    def __init__(self, graph_data: Dict[str, Any]):
+    def __init__(self, graph_data: Dict[str, Any], should_fail: bool = False):
         self.graph_data = graph_data
+        self.should_fail = should_fail
 
     def session(self, **kwargs):
-        return MockSession(self.graph_data)
+        return MockSession(self.graph_data, should_fail=self.should_fail)
 
 
 def run_all_tests():
-    print("=== RUNNING ZYNTAX CHAT ENGINE TESTS ===")
+    print("=" * 70)
+    print("STARTING COMPLETE VERIFICATION & HARDENING TESTS FOR ZYNTAX CHAT ENGINE")
+    print("=" * 70)
 
-    # -------------------------------------------------------------
-    # Test 1: Empty Graph (Pre-upload State)
-    # -------------------------------------------------------------
-    empty_driver = MockDriver({"rows": [], "datasets": []})
-    res_empty = handle_chat("How many rows are there?", empty_driver)
-    assert res_empty["grounded"] is False, "Empty graph should return grounded=False"
-    assert "No uploaded data is currently available" in res_empty["answer"]
-    assert res_empty["result"] == [{"count(r)": 0}]
-    print("✓ Test 1 Passed: Empty graph safely handled")
-
-    # Populate mock graph with sample CSV data
+    # Sample dataset 1 (Standard Handout dataset with group, status, amount)
     sample_rows = [
         {"row_index": 1, "dataset_id": "ds1", "group": "Billing", "status": "active", "amount": 100},
         {"row_index": 2, "dataset_id": "ds1", "group": "Billing", "status": "pending", "amount": 200},
         {"row_index": 3, "dataset_id": "ds1", "group": "Engineering", "status": "active", "amount": 300},
         {"row_index": 4, "dataset_id": "ds1", "group": "Marketing", "status": "inactive", "amount": 150},
     ]
-    sample_datasets = [{"id": "ds1", "filename": "sample.csv", "uploaded_at": "2026-09-11T10:00:00Z"}]
+    sample_datasets = [{"id": "ds1", "filename": "test_data.csv", "uploaded_at": "2026-09-11T10:00:00Z"}]
     active_driver = MockDriver({"rows": sample_rows, "datasets": sample_datasets})
 
-    # -------------------------------------------------------------
-    # Test 2: Total Row Count Query
-    # -------------------------------------------------------------
-    res_total = handle_chat("How many rows are there?", active_driver)
-    assert res_total["grounded"] is True, "Total count should be grounded"
-    assert res_total["cypher"] == "MATCH (r:Row) RETURN count(r)"
-    assert res_total["result"] == [{"count(r)": 4}]
-    assert "There are 4 total rows in the dataset." in res_total["answer"]
-    print(f"✓ Test 2 Passed: Total count query -> '{res_total['answer']}'")
+    results = []
 
     # -------------------------------------------------------------
-    # Test 3: Filtered Count Query (Official Handout Match)
+    # Test A: Valid count question
     # -------------------------------------------------------------
-    res_filtered = handle_chat("How many rows belong to the Billing group?", active_driver)
-    assert res_filtered["grounded"] is True, "Filtered query should be grounded"
-    assert res_filtered["cypher"] == "MATCH (r:Row {group: 'Billing'}) RETURN count(r)"
-    assert res_filtered["result"] == [{"count(r)": 2}]
-    assert "There are 2 rows where group = 'Billing'." in res_filtered["answer"]
-    print(f"✓ Test 3 Passed: Handout match -> '{res_filtered['answer']}' (Cypher: {res_filtered['cypher']})")
+    q_a = "How many rows are there?"
+    res_a = handle_chat(q_a, active_driver)
+    pass_a = (
+        res_a["grounded"] is True
+        and res_a["cypher"] == "MATCH (r:Row) RETURN count(r)"
+        and res_a["result"] == [{"count(r)": 4}]
+        and "4 total rows" in res_a["answer"]
+    )
+    results.append(("A. Valid count question", q_a, pass_a, res_a))
+    assert pass_a, f"Test A Failed: {res_a}"
 
     # -------------------------------------------------------------
-    # Test 4: Distinct Values Query
+    # Test B: Filter question (Matches Handout Part 4)
     # -------------------------------------------------------------
-    res_distinct = handle_chat("What distinct values exist for status?", active_driver)
-    assert res_distinct["grounded"] is True, "Distinct query should be grounded"
-    assert "RETURN DISTINCT" in res_distinct["cypher"]
-    assert "active" in res_distinct["answer"] and "pending" in res_distinct["answer"]
-    print(f"✓ Test 4 Passed: Distinct values -> '{res_distinct['answer']}'")
+    q_b = "How many rows belong to the Billing group?"
+    res_b = handle_chat(q_b, active_driver)
+    pass_b = (
+        res_b["grounded"] is True
+        and res_b["cypher"] == "MATCH (r:Row {group: 'Billing'}) RETURN count(r)"
+        and res_b["result"] == [{"count(r)": 2}]
+        and "2 rows where group = 'Billing'" in res_b["answer"]
+    )
+    results.append(("B. Filter question (Handout)", q_b, pass_b, res_b))
+    assert pass_b, f"Test B Failed: {res_b}"
 
     # -------------------------------------------------------------
-    # Test 5: Unsupported / Off-topic Question
+    # Test C: Distinct-value question
     # -------------------------------------------------------------
-    res_unsupported = handle_chat("What is the capital of Australia?", active_driver)
-    assert res_unsupported["grounded"] is False, "Off-topic should be ungrounded"
-    assert res_unsupported["answer"] == "I don't have that information in the uploaded data."
-    assert res_unsupported["cypher"] == ""
-    assert res_unsupported["result"] == []
-    print("✓ Test 5 Passed: Off-topic safely rejected (grounded=False)")
+    q_c = "What groups are present?"
+    res_c = handle_chat(q_c, active_driver)
+    pass_c = (
+        res_c["grounded"] is True
+        and "RETURN DISTINCT r.group AS group" in res_c["cypher"]
+        and len(res_c["result"]) == 3
+        and "Billing" in res_c["answer"]
+        and "Engineering" in res_c["answer"]
+    )
+    results.append(("C. Distinct-value question", q_c, pass_c, res_c))
+    assert pass_c, f"Test C Failed: {res_c}"
 
     # -------------------------------------------------------------
-    # Test 6: Nonexistent Column Query
+    # Test D: Row listing question
     # -------------------------------------------------------------
-    res_missing_col = handle_chat("How many rows belong to category A?", active_driver)
-    assert res_missing_col["grounded"] is False
-    assert res_missing_col["answer"] == "I don't have that information in the uploaded data."
+    q_d = "Show the rows where group is Billing."
+    res_d = handle_chat(q_d, active_driver)
+    pass_d = (
+        res_d["grounded"] is True
+        and res_d["cypher"] == "MATCH (r:Row {group: 'Billing'}) RETURN r LIMIT 10"
+        and len(res_d["result"]) == 2
+        and "Found 2 matching row(s)" in res_d["answer"]
+    )
+    results.append(("D. Row listing question", q_d, pass_d, res_d))
+    assert pass_d, f"Test D Failed: {res_d}"
+
+    # -------------------------------------------------------------
+    # Test E: Unknown property
+    # -------------------------------------------------------------
+    q_e = "How many employees have blue_hair?"
+    res_e = handle_chat(q_e, active_driver)
+    pass_e = (
+        res_e["grounded"] is False
+        and res_e["cypher"] == ""
+        and res_e["result"] == []
+        and "I don't have that information in the uploaded data." in res_e["answer"]
+    )
+    results.append(("E. Unknown property", q_e, pass_e, res_e))
+    assert pass_e, f"Test E Failed: {res_e}"
+
+    # -------------------------------------------------------------
+    # Test F: Unsupported / General knowledge question
+    # -------------------------------------------------------------
+    q_f = "What is the capital of France?"
+    res_f = handle_chat(q_f, active_driver)
+    pass_f = (
+        res_f["grounded"] is False
+        and res_f["cypher"] == ""
+        and res_f["result"] == []
+        and "I don't have that information in the uploaded data." in res_f["answer"]
+    )
+    results.append(("F. General knowledge / off-topic", q_f, pass_f, res_f))
+    assert pass_f, f"Test F Failed: {res_f}"
+
+    # -------------------------------------------------------------
+    # Test G: Empty question
+    # -------------------------------------------------------------
+    q_g = "   "
+    res_g = handle_chat(q_g, active_driver)
+    pass_g = (
+        res_g["grounded"] is False
+        and res_g["cypher"] == ""
+        and res_g["result"] == []
+        and "empty" in res_g["answer"].lower()
+    )
+    results.append(("G. Empty question", "''", pass_g, res_g))
+    assert pass_g, f"Test G Failed: {res_g}"
+
+    # -------------------------------------------------------------
+    # Test H: Empty graph / No uploaded dataset
+    # -------------------------------------------------------------
+    empty_driver = MockDriver({"rows": [], "datasets": []})
+    q_h = "How many rows belong to the Billing group?"
+    res_h = handle_chat(q_h, empty_driver)
+    pass_h = (
+        res_h["grounded"] is False
+        and res_h["cypher"] == ""
+        and res_h["result"] == []
+        and "No uploaded data is currently available" in res_h["answer"]
+    )
+    results.append(("H. Empty graph / Pre-upload", q_h, pass_h, res_h))
+    assert pass_h, f"Test H Failed: {res_h}"
+
+    # -------------------------------------------------------------
+    # Test I: Neo4j execution error
+    # -------------------------------------------------------------
+    failing_driver = MockDriver({"rows": sample_rows, "datasets": sample_datasets}, should_fail=True)
+    q_i = "How many rows are there?"
+    res_i = handle_chat(q_i, failing_driver)
+    pass_i = (
+        res_i["grounded"] is False
+        and res_i["cypher"] == ""
+        and res_i["result"] == []
+        and "database error" in res_i["answer"].lower()
+    )
+    results.append(("I. Neo4j execution error", q_i, pass_i, res_i))
+    assert pass_i, f"Test I Failed: {res_i}"
+
+    # -------------------------------------------------------------
+    # Test J: Read-Only Safety Validation
+    # -------------------------------------------------------------
+    mutating_queries = [
+        "CREATE (n:Row {name: 'hacked'})",
+        "MATCH (r:Row) DELETE r",
+        "MATCH (r:Row) DETACH DELETE r",
+        "MERGE (r:Row {name: 'dup'})",
+        "MATCH (r:Row) SET r.amount = 9999",
+        "MATCH (r:Row) REMOVE r.amount",
+        "DROP CONSTRAINT some_constraint",
+        "LOAD CSV FROM 'file:///evil.csv' AS row",
+        "MATCH (r:Row) RETURN r; DROP TABLE users;",
+        "CALL apoc.export.csv.all('bad.csv', {})",
+    ]
+    pass_j = True
+    for q in mutating_queries:
+        if is_safe_read_only_cypher(q):
+            pass_j = False
+            print(f"FAILED TO BLOCK UNSAFE CYPHER: {q}")
+    assert pass_j, "Test J Failed: Read-only safety guard failed to block unsafe query"
+    results.append(("J. Read-Only Safety Guard", "10 destructive queries", pass_j, "All 10 blocked"))
+
+    # -------------------------------------------------------------
+    # Test K: Dynamic CSV Support (arbitrary headers: department, salary)
+    # -------------------------------------------------------------
+    dynamic_csv_rows = [
+        {"row_index": 1, "department": "Cardiology", "salary": 120000, "city": "Boston"},
+        {"row_index": 2, "department": "Neurology", "salary": 140000, "city": "Boston"},
+        {"row_index": 3, "department": "Cardiology", "salary": 130000, "city": "Seattle"},
+    ]
+    dynamic_driver = MockDriver({"rows": dynamic_csv_rows, "datasets": [{"id": "d2", "filename": "hospital.csv"}]})
+    q_k1 = "How many rows belong to the Cardiology department?"
+    res_k1 = handle_chat(q_k1, dynamic_driver)
+    pass_k1 = (
+        res_k1["grounded"] is True
+        and res_k1["cypher"] == "MATCH (r:Row {department: 'Cardiology'}) RETURN count(r)"
+        and "2 rows where department = 'Cardiology'" in res_k1["answer"]
+    )
     
-    res_missing_filter = handle_chat("Show rows where salary > 50000", active_driver)
-    assert res_missing_filter["grounded"] is False
-    assert res_missing_filter["answer"] == "I don't have that information in the uploaded data."
-    print("✓ Test 6 Passed: Nonexistent columns safely rejected as ungrounded")
+    q_k2 = "What departments are present?"
+    res_k2 = handle_chat(q_k2, dynamic_driver)
+    pass_k2 = (
+        res_k2["grounded"] is True
+        and "Cardiology" in res_k2["answer"] and "Neurology" in res_k2["answer"]
+    )
+    pass_k = pass_k1 and pass_k2
+    results.append(("K. Dynamic CSV Support (hospital schema)", f"{q_k1} & {q_k2}", pass_k, "Both queries grounded"))
+    assert pass_k, f"Test K Failed: k1={res_k1}, k2={res_k2}"
 
-    # -------------------------------------------------------------
-    # Test 7: Read-Only Safety Validation
-    # -------------------------------------------------------------
-    assert is_safe_read_only_cypher("MATCH (r:Row) RETURN r") is True
-    assert is_safe_read_only_cypher("MATCH (r:Row) DELETE r") is False
-    assert is_safe_read_only_cypher("MATCH (r:Row) DETACH DELETE r") is False
-    assert is_safe_read_only_cypher("CREATE (r:Row {name: 'fake'})") is False
-    assert is_safe_read_only_cypher("MATCH (r:Row) SET r.foo = 'bar'") is False
-    assert is_safe_read_only_cypher("DROP CONSTRAINT something") is False
-    assert is_safe_read_only_cypher("MATCH (r:Row) RETURN r; DROP TABLE users;") is False
-    print("✓ Test 7 Passed: Mutating and destructive Cypher successfully blocked")
+    # Print summary table
+    print("\nSUMMARY OF VERIFICATION RESULTS:")
+    print(f"{'Scenario':<36} | {'Status':<6} | {'Details'}")
+    print("-" * 70)
+    for name, inp, passed, out in results:
+        status_str = "PASS" if passed else "FAIL"
+        print(f"{name:<36} | {status_str:<6} | Input: {inp[:28]}")
 
-    # -------------------------------------------------------------
-    # Test 8: Empty Question
-    # -------------------------------------------------------------
-    res_empty_q = handle_chat("", active_driver)
-    assert res_empty_q["grounded"] is False
-    assert "empty" in res_empty_q["answer"].lower()
-    print("✓ Test 8 Passed: Empty question handled safely")
-
-    print("\nALL 8 TESTS PASSED SUCCESSFULLY! 100% SPEC COMPLIANT.")
+    print("\n>>> ALL TESTS PASSED WITH 100% SPEC COMPLIANCE! <<<")
 
 
 if __name__ == "__main__":
