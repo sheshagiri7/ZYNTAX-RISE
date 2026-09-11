@@ -78,6 +78,14 @@ class MockSession:
             keys = list(self.graph_data["rows"][0].keys())
             return MockResult([{"keys": keys}])
 
+        # Dataset summary: MATCH (d:Dataset) ... total_rows ...
+        if "MATCH (d:Dataset)" in cypher_stripped and "total_rows" in cypher_stripped:
+            datasets = self.graph_data.get("datasets", [{"filename": "employees.csv"}])
+            fn = datasets[0].get("filename", "employees.csv") if datasets else "employees.csv"
+            rows = self.graph_data.get("rows", [])
+            cols = [k for k in rows[0].keys() if k not in ("dataset_id", "row_index")] if rows else []
+            return MockResult([{"filename": fn, "total_rows": len(rows), "columns": cols}])
+
         # Datasets
         if "MATCH (d:Dataset)" in cypher_stripped:
             return MockResult(self.graph_data.get("datasets", []))
@@ -334,10 +342,24 @@ def run_all_tests():
     results.append(("K. Dynamic CSV Support (hospital schema)", f"{q_k1} & {q_k2}", pass_k, "Both queries grounded"))
     assert pass_k, f"Test K Failed: k1={res_k1}, k2={res_k2}"
 
+    # -------------------------------------------------------------
+    # Test L: Broad dataset summary ("What is the content?")
+    # -------------------------------------------------------------
+    q_l = "What is the content?"
+    res_l = handle_chat(q_l, active_driver)
+    pass_l = (
+        res_l["grounded"] is True
+        and "MATCH (d:Dataset)" in res_l["cypher"]
+        and "test_data.csv" in res_l["answer"]
+        and "rows with columns:" in res_l["answer"]
+    )
+    results.append(("L. Broad dataset question", q_l, pass_l, res_l["answer"]))
+    assert pass_l, f"Test L Failed: {res_l}"
+
     # Print summary table
     print("\nSUMMARY OF VERIFICATION RESULTS:")
-    print(f"{'Scenario':<36} | {'Status':<6} | {'Details'}")
-    print("-" * 70)
+    print(f"{'Scenario':<40} | {'Status':<6} | {'Details'}")
+    print("-" * 75)
     for name, inp, passed, out in results:
         status_str = "PASS" if passed else "FAIL"
         print(f"{name:<36} | {status_str:<6} | Input: {inp[:28]}")

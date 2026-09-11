@@ -1,0 +1,14 @@
+# Production Dockerfile for ZYNTAX UI Service
+# Pinned Nginx 1.27.4-alpine running strictly as non-root user (uid 101)
+FROM nginx:1.27.4-alpine
+
+# Set up non-root user environment (nginx user uid 101)
+RUN sed -i 's/user  nginx;//g' /etc/nginx/nginx.conf && \
+    touch /var/run/nginx.pid && \
+    chown -R nginx:nginx /var/run/nginx.pid /var/cache/nginx /etc/nginx /usr/share/nginx/html
+
+USER nginx
+
+EXPOSE 8080
+
+CMD ["nginx", "-g", "daemon off;"]

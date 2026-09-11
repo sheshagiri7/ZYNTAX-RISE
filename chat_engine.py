@@ -320,25 +320,31 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
     if re.search(r"\b(belong(?:s)?\s+to|where|with|have|has|equals?|\bfor\s+each\b|\bper\b)\b", q_lower):
         return None, "unknown_property", False
 
-    # 8. Total row count query (genuine total count across whole dataset)
-    # e.g., "How many rows are there?", "Total rows in dataset", "Count rows"
-    if re.search(r"\b(total\s+(?:number\s+of\s+)?rows|how\s+many\s+rows(?:\s+are\s+there|\s+in\s+total|\s+in\s+(?:the\s+)?(?:data|dataset|csv|file))?|count\s+rows|total\s+records|how\s+many\s+records(?:\s+are\s+there)?)\b", q_lower):
+    # 8. Broad dataset summary / overview queries
+    # e.g., "What is the content?", "What does this dataset contain?", "Tell me about the uploaded dataset."
+    if re.search(r"\b(content|contain(?:s)?|about the (?:uploaded )?dataset|about the data|in this dataset|in the dataset|summar(?:y|ize)|overview|describe the (?:data|dataset))\b", q_lower):
+        cypher = "MATCH (d:Dataset) OPTIONAL MATCH (d)-[:HAS_ROW]->(r:Row) WITH d, count(r) AS total_rows, collect(r)[0..3] AS sample_rows ORDER BY d.uploaded_at DESC RETURN d.filename AS filename, total_rows, [k IN keys(sample_rows[0]) WHERE NOT k IN ['dataset_id', 'row_index']] AS columns LIMIT 1"
+        return cypher, "dataset_summary", True
+
+    # 9. Total row count query (genuine total count across whole dataset)
+    # e.g., "How many rows are there?", "How many rows are in the dataset?", "Total rows in dataset", "Count rows"
+    if re.search(r"\b(how\s+many\s+(?:total\s+)?(?:rows|records)|total\s+(?:number\s+of\s+)?rows|count\s+(?:total\s+)?rows|total\s+records)\b", q_lower):
         cypher = "MATCH (r:Row) RETURN count(r)"
         return cypher, "total_count", True
 
-    # 9. Generic preview / list rows (when no column is specified)
-    # e.g., "Show rows", "Preview data", "Show first 5 records"
-    if re.search(r"\b(preview|show\s+rows|list\s+rows|sample\s+rows|display\s+data)\b", q_lower):
+    # 10. Generic preview / list rows (when no column is specified)
+    # e.g., "Show rows", "Show some rows", "Show me some rows", "Preview data", "Show first 5 records"
+    if re.search(r"\b(preview|show|list|display|sample|view)\b.*\b(rows?|records?|data)\b", q_lower):
         cypher = "MATCH (r:Row) RETURN r LIMIT 5"
         return cypher, "preview_rows", True
 
-    # 10. Schema / Column listing
-    # e.g., "What columns are there?", "What fields exist?", "Show schema"
-    if re.search(r"\b(columns|fields|schema|properties|headers)\b", q_lower):
-        cypher = "MATCH (r:Row) RETURN keys(r) AS columns LIMIT 1"
+    # 11. Schema / Column listing
+    # e.g., "What columns are available?", "What columns are there?", "What fields exist?", "Show schema"
+    if re.search(r"\b(columns?|fields?|schema|properties|headers?)\b", q_lower):
+        cypher = "MATCH (r:Row) RETURN [k IN keys(r) WHERE NOT k IN ['dataset_id', 'row_index']] AS columns LIMIT 1"
         return cypher, "schema_info", True
 
-    # 11. Dataset listing
+    # 12. Dataset listing
     if re.search(r"\b(datasets|files|uploaded|filename)\b", q_lower):
         cypher = "MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename, d.uploaded_at AS uploaded_at"
         return cypher, "dataset_info", True
@@ -439,7 +445,21 @@ def format_answer_from_result(
             return f"The dataset contains columns: {', '.join(props)}.", True
         return "No column schema could be extracted.", False
 
-    # 8. Dataset info
+    # 8. Dataset summary (Broad dataset overview questions)
+    if query_type == "dataset_summary":
+        if result:
+            rec = result[0]
+            filename = rec.get("filename", "uploaded dataset")
+            total = rec.get("total_rows", 0)
+            cols = rec.get("columns") or []
+            cols_clean = [c for c in cols if c not in ("dataset_id", "row_index")]
+            if cols_clean:
+                cols_str = ", ".join(cols_clean)
+                return f"The dataset '{filename}' contains {total:,} rows with columns: {cols_str}.", True
+            return f"The dataset '{filename}' contains {total:,} rows.", True
+        return "No dataset information found in graph.", False
+
+    # 9. Dataset info
     if query_type == "dataset_info":
         if result:
             filenames = [d.get("filename", "unknown") for d in result]

@@ -48,27 +48,31 @@ def check_kafka_socket(servers: str) -> bool:
 def is_kafka_connected() -> bool:
     """
     Checks if Kafka is genuinely reachable.
-    Does NOT report True unless brokers respond.
+    Does NOT report True unless brokers genuinely respond to queries.
+    Uses fast socket probe followed by KafkaAdminClient cluster introspection.
+    Never caches stale connection state.
     """
     global _custom_producer
     if _custom_producer is not None:
         return getattr(_custom_producer, "is_connected", True)
 
     try:
-        # First check raw socket
+        # Step 1: Raw TCP socket probe (fast failure if broker offline)
         if not check_kafka_socket(KAFKA_BOOTSTRAP_SERVERS):
             return False
 
-        # Attempt to probe broker via Kafka client
-        from kafka import KafkaProducer
-        p = get_producer()
-        if p is not None:
-            # Check cluster metadata bootstrap
-            bootstrap = p.bootstrap_connected() if hasattr(p, "bootstrap_connected") else True
-            return bool(bootstrap)
-        return False
+        # Step 2: Genuine broker introspection via Kafka Admin API
+        from kafka.admin import KafkaAdminClient
+        admin = KafkaAdminClient(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+            request_timeout_ms=2000,
+            api_version=(2, 6, 0)
+        )
+        cluster = admin.describe_cluster()
+        admin.close()
+        return bool(cluster and "brokers" in cluster and len(cluster["brokers"]) > 0)
     except Exception as e:
-        logger.debug(f"Kafka health check failed: {e}")
+        logger.debug(f"Kafka health check probe error: {e}")
         return False
 
 
