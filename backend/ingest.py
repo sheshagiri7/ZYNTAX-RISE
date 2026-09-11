@@ -32,7 +32,7 @@ def clean_row_values(row: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in row.items():
         if k is None:
             continue
-        key_str = str(k).strip()
+        key_str = str(k).lstrip("\ufeff").strip()
         if not key_str:
             continue
 

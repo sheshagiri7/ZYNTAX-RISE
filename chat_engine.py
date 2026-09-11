@@ -137,14 +137,23 @@ def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> D
                 keys_res = session.run("MATCH (r:Row) RETURN keys(r) AS keys LIMIT 50")
                 prop_set = set()
                 for rec in keys_res:
-                    prop_set.update(rec["keys"])
-                    
+                    if rec and rec["keys"]:
+                        prop_set.update(rec["keys"])
+
                 props = sorted(list(prop_set))
                 schema["properties"] = props
-                schema["property_map"] = {p.lower(): p for p in props}
+                
+                # Map lowercase property names, including UTF-8 BOM stripped versions
+                prop_map = {}
+                for p in props:
+                    prop_map[p.lower()] = p
+                    clean_p = p.lstrip("\ufeff").strip()
+                    if clean_p:
+                        prop_map[clean_p.lower()] = p
+                schema["property_map"] = prop_map
                 
                 # 3. Extract datasets
-                dataset_res = session.run("MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename LIMIT 10")
+                dataset_res = session.run("MATCH (d:Dataset) RETURN d.id AS id, d.filename AS filename ORDER BY d.uploaded_at DESC LIMIT 10")
                 schema["datasets"] = [d.data() for d in dataset_res]
                 schema["error"] = None
                 return schema
@@ -161,6 +170,13 @@ def get_graph_schema(driver: Any, database: Optional[str] = "CSV_Graph_DB") -> D
 # 3. DYNAMIC COLUMN MATCHING & QUESTION -> CYPHER TEMPLATES
 # -----------------------------------------------------------------------------
 
+def escape_prop(col: str) -> str:
+    """Format property name for Cypher: simple alphanumeric identifiers stay unquoted, otherwise wrap in backticks."""
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col):
+        return col
+    return f"`{col}`"
+
+
 def get_column_variants(prop: str) -> List[str]:
     """
     Generates likely natural language variations of a column name.
@@ -169,7 +185,7 @@ def get_column_variants(prop: str) -> List[str]:
          'category' -> ['category', 'categories']
          'status' -> ['status', 'statuses']
     """
-    p = prop.lower().strip()
+    p = prop.lstrip("\ufeff").lower().strip()
     variants = [p]
     if "_" in p:
         variants.append(p.replace("_", " "))
@@ -230,8 +246,10 @@ def extract_filter_value(question: str, col_name: str) -> Optional[str]:
     patterns = [
         # "belong to the Billing group" / "belong to Billing group"
         rf"(?:belong(?:s)?\s+to(?: the)?|in(?: the)?)\s+['\"]?([^'\"]+?)['\"]?\s+{col_group}\b",
-        # "where group is 'Billing'" / "where group = Billing"
-        rf"\b{col_group}\s*(?:=|is|equals|are|of|:)\s*['\"]?([^'\"?.,;]+)['\"]?",
+        # "where group equal to Billing" / "where group = Billing" / "group is active"
+        rf"\b{col_group}\s*(?:equal\s+to|equals?|=|is|are|of|:)\s*['\"]?([^'\"?.,;]+)[\'\"]?",
+        # "status active" (e.g. "with status active")
+        rf"\b{col_group}\s+['\"]?([a-zA-Z0-9_-]+)[\'\"]?",
         # "group 'Billing'"
         rf"\b{col_group}\s+['\"]([^'\"]+)['\"]",
         # "Billing group"
@@ -241,7 +259,8 @@ def extract_filter_value(question: str, col_name: str) -> Optional[str]:
     stop_words = {
         "the", "a", "an", "each", "every", "all", "what", "which",
         "how", "many", "rows", "records", "is", "are", "present",
-        "there", "exist", "available", "distinct", "unique", "values"
+        "there", "exist", "available", "distinct", "unique", "values",
+        "have", "has", "with", "where", "belong", "belongs", "to", "for"
     }
 
     for pat in patterns:
@@ -265,83 +284,88 @@ def generate_cypher_template(question: str, schema: Dict[str, Any]) -> Tuple[Opt
     q_lower = q_clean.lower()
     prop_map = schema.get("property_map", {})
 
-    # 1. Identify dynamic column from question
+    # 0. Identify dynamic column from question if present
     col = find_column_in_question(q_clean, prop_map)
 
-    # 2. Distinct values / categories query
-    # e.g., "What groups are present?", "What groups exist?", "List distinct departments", "Show unique status"
-    if col and re.search(r"\b(distinct|unique|values|present|exist|available|what\s+[a-z_]+\s+(?:are|exist|is)|list\s+all|show\s+all|categories)\b", q_lower):
+    # 1. Column count intent
+    # e.g., "How many columns?", "How many columns are there?", "What is the column count?", "Tell me the number of columns", "Number of columns", "Count columns"
+    if re.search(r"\b(how\s+many\s+(?:total\s+)?columns?|column\s+count|number\s+of\s+columns?|count\s+columns?|total\s+columns?)\b", q_lower):
+        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+        return cypher, "column_count", True
+
+    # 2. Schema info / column listing
+    # e.g., "What columns are available?", "List the columns.", "Show me the column names.", "List available columns.", "What are the columns?", "Show schema", "What fields exist?"
+    if re.search(r"\b(what\s+columns|list\s+(?:the\s+)?columns?|available\s+columns|show\s+(?:me\s+)?(?:the\s+)?column\s+names?|column\s+names?|what\s+are\s+the\s+columns|columns?\s+available|show\s+schema|what\s+fields)\b", q_lower):
+        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
+        return cypher, "schema_info", True
+
+    # 3. Dataset summary / overview
+    # e.g., "What is the content?", "What does this dataset contain?", "Tell me about this file.", "Tell me about the uploaded dataset.", "Give me a summary of the uploaded data."
+    if re.search(r"\b(content|contain(?:s)?|about this file|about the (?:uploaded )?dataset|about the data|what\s+is\s+in\s+this\s+dataset|what\s+is\s+in\s+the\s+dataset|summary of the (?:uploaded )?data|summar(?:y|ize)|overview|describe the (?:data|dataset))\b", q_lower):
+        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, count(r) AS total_rows, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, total_rows, all_rows, collect(DISTINCT key_item) AS all_keys WITH d, total_rows, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns, all_rows[0..3] AS sample_rows RETURN coalesce(d.filename, 'uploaded dataset') AS filename, total_rows, size(columns) AS column_count, columns, sample_rows"
+        return cypher, "dataset_summary", True
+
+    # 4. Unrecognized property filter check:
+    # If col was NOT found, but the question attempts to filter/condition ("where", "with", "have", "blue_hair", "green_eyes", etc.),
+    # reject immediately to prevent ungrounded queries from falling through to general row count.
+    if not col and re.search(r"\b(belong(?:s)?\s+to|where|with|have|has|equals?|equal\s+to|\bfor\s+each\b|\bper\b)\b", q_lower):
+        return None, "unknown_property", False
+
+    # 5. Breakdown by column (e.g., "Give me a breakdown by group.", "How many rows are in each group?", "Breakdown by department")
+    if col and re.search(r"\b(breakdown|per|by|distribution|each)\b", q_lower):
+        prop = escape_prop(col)
+        cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r.{prop} AS {prop}, count(r) AS count ORDER BY count DESC LIMIT 20"
+        return cypher, "group_breakdown", True
+
+    # 6. Distinct values / categories query
+    # e.g., "What values are in group?", "List unique group values.", "What groups are present?"
+    if col and re.search(r"\b(distinct|unique|values|present|exist|available|what\s+[a-z_0-9-]+\s+(?:are|exist|is)|list\s+all|show\s+all|categories)\b", q_lower):
         if not re.search(r"\b(how\s+many\s+rows|count\s+rows|number\s+of\s+rows)\b", q_lower):
-            cypher = f"MATCH (r:Row) WHERE r.{col} IS NOT NULL RETURN DISTINCT r.{col} AS {col} ORDER BY {col} LIMIT 25"
+            prop = escape_prop(col)
+            cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN DISTINCT r.{prop} AS {prop} ORDER BY {prop} LIMIT 25"
             return cypher, "distinct_values", True
 
-    # 3. Row listing / preview of specific rows
+    # 7. Row listing / preview of specific rows
     # e.g., "Show the rows where group is Billing.", "Show rows with status active"
     if col and re.search(r"\b(show|list|display|find|get|see|view|preview)\b.*\b(rows?|records?)\b", q_lower):
         val = extract_filter_value(q_clean, col)
+        prop = escape_prop(col)
         if val:
             safe_val = val.replace("'", "\\'")
-            cypher = f"MATCH (r:Row {{{col}: '{safe_val}'}}) RETURN r LIMIT 10"
+            cypher = f"MATCH (r:Row {{{prop}: '{safe_val}'}}) RETURN r LIMIT 10"
             return cypher, "filtered_rows", True
         else:
-            cypher = f"MATCH (r:Row) WHERE r.{col} IS NOT NULL RETURN r LIMIT 10"
+            cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r LIMIT 10"
             return cypher, "filtered_rows", True
 
-    # 4. Filtered count queries (Matches Handout Part 4)
-    # e.g., "How many rows belong to the Billing group?"
-    # e.g., "How many rows have status active?"
-    if re.search(r"\b(how\s+many\s+rows|count\s+rows|number\s+of\s+rows|how\s+many\s+records)\b", q_lower) and col:
+    # 8. Filtered count queries
+    # e.g., "How many rows have group equal to Billing?", "Count rows where group = Billing.", "How many rows belong to the Billing group?"
+    if col and re.search(r"\b(how\s+many\s+rows|count\s+rows|number\s+of\s+rows|how\s+many\s+records)\b", q_lower):
         val = extract_filter_value(q_clean, col)
+        prop = escape_prop(col)
         if val:
             safe_val = val.replace("'", "\\'")
-            cypher = f"MATCH (r:Row {{{col}: '{safe_val}'}}) RETURN count(r)"
+            cypher = f"MATCH (r:Row {{{prop}: '{safe_val}'}}) RETURN count(r)"
             return cypher, "filtered_count", True
         else:
-            cypher = f"MATCH (r:Row) WHERE r.{col} IS NOT NULL RETURN r.{col} AS {col}, count(r) AS count ORDER BY count DESC LIMIT 20"
+            cypher = f"MATCH (r:Row) WHERE r.{prop} IS NOT NULL RETURN r.{prop} AS {prop}, count(r) AS count ORDER BY count DESC LIMIT 20"
             return cypher, "group_breakdown", True
 
-    # 5. Breakdown / Distribution by column
-    # e.g., "Breakdown by department", "Rows per group"
-    if col and re.search(r"\b(breakdown|per|by|distribution|summary)\b", q_lower):
-        cypher = f"MATCH (r:Row) WHERE r.{col} IS NOT NULL RETURN r.{col} AS {col}, count(r) AS count ORDER BY count DESC LIMIT 20"
-        return cypher, "group_breakdown", True
-
-    # 6. Filtered rows retrieval fallback when col and val are recognized
-    if col:
-        val = extract_filter_value(q_clean, col)
-        if val:
-            safe_val = val.replace("'", "\\'")
-            cypher = f"MATCH (r:Row {{{col}: '{safe_val}'}}) RETURN r LIMIT 10"
-            return cypher, "filtered_rows", True
-
-    # 7. Unrecognized property check:
-    # If col was NOT found, but the question attempts to filter/condition ("where", "with", "have", "blue_hair", etc.),
-    # reject immediately to prevent ungrounded queries.
-    if re.search(r"\b(belong(?:s)?\s+to|where|with|have|has|equals?|\bfor\s+each\b|\bper\b)\b", q_lower):
-        return None, "unknown_property", False
-
-    # 8. Broad dataset summary / overview queries
-    # e.g., "What is the content?", "What does this dataset contain?", "Tell me about the uploaded dataset."
-    if re.search(r"\b(content|contain(?:s)?|about the (?:uploaded )?dataset|about the data|in this dataset|in the dataset|summar(?:y|ize)|overview|describe the (?:data|dataset))\b", q_lower):
-        cypher = "MATCH (d:Dataset) OPTIONAL MATCH (d)-[:HAS_ROW]->(r:Row) WITH d, count(r) AS total_rows, collect(r)[0..3] AS sample_rows ORDER BY d.uploaded_at DESC RETURN d.filename AS filename, total_rows, [k IN keys(sample_rows[0]) WHERE NOT k IN ['dataset_id', 'row_index']] AS columns LIMIT 1"
-        return cypher, "dataset_summary", True
-
     # 9. Total row count query (genuine total count across whole dataset)
-    # e.g., "How many rows are there?", "How many rows are in the dataset?", "Total rows in dataset", "Count rows"
-    if re.search(r"\b(how\s+many\s+(?:total\s+)?(?:rows|records)|total\s+(?:number\s+of\s+)?rows|count\s+(?:total\s+)?rows|total\s+records)\b", q_lower):
+    # e.g., "How many rows are there?", "How many rows?", "What is the number of rows?", "What is the row count?", "Tell me how many records are there"
+    if re.search(r"\b(how\s+many\s+(?:total\s+)?(?:rows|records)|what\s+is\s+the\s+(?:number\s+of\s+rows|row\s+count)|number\s+of\s+rows|row\s+count|total\s+(?:number\s+of\s+)?rows|count\s+(?:total\s+)?rows|total\s+records)\b", q_lower):
         cypher = "MATCH (r:Row) RETURN count(r)"
         return cypher, "total_count", True
 
     # 10. Generic preview / list rows (when no column is specified)
-    # e.g., "Show rows", "Show some rows", "Show me some rows", "Preview data", "Show first 5 records"
+    # e.g., "Show me some rows.", "Show first 5 rows.", "Give me a sample of the data.", "Preview data"
     if re.search(r"\b(preview|show|list|display|sample|view)\b.*\b(rows?|records?|data)\b", q_lower):
-        cypher = "MATCH (r:Row) RETURN r LIMIT 5"
+        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) RETURN r LIMIT 5"
         return cypher, "preview_rows", True
 
-    # 11. Schema / Column listing
-    # e.g., "What columns are available?", "What columns are there?", "What fields exist?", "Show schema"
+    # 11. General columns fallback
     if re.search(r"\b(columns?|fields?|schema|properties|headers?)\b", q_lower):
-        cypher = "MATCH (r:Row) RETURN [k IN keys(r) WHERE NOT k IN ['dataset_id', 'row_index']] AS columns LIMIT 1"
+        cypher = "OPTIONAL MATCH (d:Dataset) WITH d ORDER BY d.uploaded_at DESC LIMIT 1 MATCH (r:Row) WHERE (d IS NULL) OR (r.dataset_id = d.id) WITH d, collect(r) AS all_rows UNWIND all_rows AS row_item UNWIND keys(row_item) AS key_item WITH d, collect(DISTINCT key_item) AS all_keys WITH d, [k IN all_keys WHERE NOT k IN ['dataset_id', 'row_index']] AS columns RETURN size(columns) AS column_count, columns, coalesce(d.filename, 'uploaded dataset') AS filename"
         return cypher, "schema_info", True
 
     # 12. Dataset listing
@@ -374,10 +398,19 @@ def format_answer_from_result(
 
     # 1. Total row count
     if query_type == "total_count":
-        cnt = result[0].get("count(r)") if result else None
-        if cnt is None and result and "total" in result[0]:
-            cnt = result[0]["total"]
+        cnt = None
+        fn = None
+        if result:
+            rec = result[0]
+            cnt = rec.get("total_rows")
+            if cnt is None:
+                cnt = rec.get("count(r)")
+            if cnt is None and "total" in rec:
+                cnt = rec["total"]
+            fn = rec.get("filename")
         if cnt is not None:
+            if fn and fn != "uploaded dataset":
+                return f"There are {cnt:,} total rows in the dataset '{fn}'.", True
             return f"There are {cnt:,} total rows in the dataset.", True
         return "Unable to determine row count.", False
 
@@ -385,9 +418,9 @@ def format_answer_from_result(
     # Handout: "There are 128 rows where group = 'Billing'."
     if query_type == "filtered_count":
         cnt = result[0].get("count(r)", 0) if result else 0
-        m = re.search(r"\{(\w+):\s*'([^']+)'\}", cypher)
+        m = re.search(r"\{`?([^`:]+)`?:\s*'([^']+)'\}", cypher)
         if m:
-            col, val = m.group(1), m.group(2)
+            col, val = m.group(1).lstrip("\ufeff"), m.group(2)
             return f"There are {cnt} rows where {col} = '{val}'.", True
         return f"Found {cnt} matching rows.", True
 
@@ -395,13 +428,14 @@ def format_answer_from_result(
     if query_type == "distinct_values":
         keys = list(result[0].keys()) if result else []
         if keys:
-            col = keys[0]
-            vals = [str(r[col]) for r in result if r.get(col) is not None]
+            raw_col = keys[0]
+            col_disp = raw_col.lstrip("\ufeff")
+            vals = [str(r[raw_col]) for r in result if r.get(raw_col) is not None and str(r.get(raw_col)).strip()]
             if not vals:
-                return f"No values found for {col}.", False
+                return f"No values found for {col_disp}.", False
             sample = ", ".join(vals[:15])
             more = f" (and {len(vals)-15} more)" if len(vals) > 15 else ""
-            return f"Found {len(vals)} distinct values for {col}: {sample}{more}.", True
+            return f"Found {len(vals)} distinct values for {col_disp}: {sample}{more}.", True
         return "No distinct values found.", False
 
     # 4. Filtered rows
@@ -409,9 +443,9 @@ def format_answer_from_result(
         count = len(result)
         if count == 0:
             return "No matching rows found in the uploaded data.", False
-        m = re.search(r"\{(\w+):\s*'([^']+)'\}", cypher)
+        m = re.search(r"\{`?([^`:]+)`?:\s*'([^']+)'\}", cypher)
         if m:
-            col, val = m.group(1), m.group(2)
+            col, val = m.group(1).lstrip("\ufeff"), m.group(2)
             return f"Found {count} matching row(s) where {col} = '{val}'. Showing properties in result.", True
         return f"Found {count} matching row(s). Showing properties in result.", True
 
@@ -428,38 +462,67 @@ def format_answer_from_result(
         col_name = "group"
         for r in result[:10]:
             keys = [k for k in r.keys() if k != "count"]
-            col_name = keys[0] if keys else "group"
-            val = r.get(col_name, "Unknown")
+            raw_col = keys[0] if keys else "group"
+            col_name = raw_col.lstrip("\ufeff")
+            val = r.get(raw_col, "Unknown")
             cnt = r.get("count", 0)
-            lines.append(f"{val}: {cnt}")
+            val_disp = str(val) if str(val).strip() else "(empty)"
+            lines.append(f"{val_disp}: {cnt}")
         summary = "; ".join(lines)
         return f"Breakdown by {col_name}: {summary}.", True
 
-    # 7. Schema info
-    if query_type == "schema_info":
-        if result and "columns" in result[0]:
-            cols = [c for c in result[0]["columns"] if c not in ("row_index", "dataset_id")]
-            return f"The dataset contains the following columns: {', '.join(cols)}.", True
-        props = [p for p in schema.get("properties", []) if p not in ("row_index", "dataset_id")]
-        if props:
-            return f"The dataset contains columns: {', '.join(props)}.", True
+    # 7. Column count
+    if query_type == "column_count":
+        if result:
+            rec = result[0]
+            cnt = rec.get("column_count")
+            cols = rec.get("columns") or []
+            cols_clean = [c.lstrip("\ufeff") for c in cols if c not in ("dataset_id", "row_index")]
+            if cnt is None:
+                cnt = len(cols_clean)
+            fn = rec.get("filename")
+            if cols_clean:
+                cols_str = ", ".join(cols_clean)
+                if fn and fn != "uploaded dataset":
+                    return f"There are {cnt} columns in the uploaded dataset '{fn}': {cols_str}.", True
+                return f"There are {cnt} columns in the dataset: {cols_str}.", True
+            return f"There are {cnt} columns in the dataset.", True
         return "No column schema could be extracted.", False
 
-    # 8. Dataset summary (Broad dataset overview questions)
+    # 8. Schema info / column listing
+    if query_type == "schema_info":
+        if result:
+            rec = result[0]
+            cols = rec.get("columns") or []
+            cols_clean = [c.lstrip("\ufeff") for c in cols if c not in ("dataset_id", "row_index")]
+            cnt = rec.get("column_count", len(cols_clean))
+            fn = rec.get("filename")
+            if cols_clean:
+                cols_str = ", ".join(cols_clean)
+                if fn and fn != "uploaded dataset":
+                    return f"The available columns in '{fn}' are: {cols_str} ({cnt} columns total).", True
+                return f"The available columns are: {cols_str} ({cnt} columns total).", True
+        props = [p.lstrip("\ufeff") for p in schema.get("properties", []) if p not in ("row_index", "dataset_id")]
+        if props:
+            return f"The available columns are: {', '.join(props)} ({len(props)} columns total).", True
+        return "No column schema could be extracted.", False
+
+    # 9. Dataset summary (Broad dataset overview questions)
     if query_type == "dataset_summary":
         if result:
             rec = result[0]
             filename = rec.get("filename", "uploaded dataset")
             total = rec.get("total_rows", 0)
             cols = rec.get("columns") or []
-            cols_clean = [c for c in cols if c not in ("dataset_id", "row_index")]
+            cols_clean = [c.lstrip("\ufeff") for c in cols if c not in ("dataset_id", "row_index")]
+            cnt = rec.get("column_count", len(cols_clean))
             if cols_clean:
                 cols_str = ", ".join(cols_clean)
-                return f"The dataset '{filename}' contains {total:,} rows with columns: {cols_str}.", True
-            return f"The dataset '{filename}' contains {total:,} rows.", True
+                return f"The uploaded dataset '{filename}' contains {total:,} rows across {cnt} columns. The available columns are: {cols_str}.", True
+            return f"The uploaded dataset '{filename}' contains {total:,} rows across {cnt} columns.", True
         return "No dataset information found in graph.", False
 
-    # 9. Dataset info
+    # 10. Dataset info
     if query_type == "dataset_info":
         if result:
             filenames = [d.get("filename", "unknown") for d in result]

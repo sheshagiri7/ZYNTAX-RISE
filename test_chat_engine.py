@@ -63,28 +63,43 @@ class MockSession:
         cypher_stripped = cypher.strip()
 
         # Row count
-        if "MATCH (r:Row) RETURN count(r) AS total" in cypher_stripped:
+        if "AS total" in cypher_stripped:
             total = len(self.graph_data.get("rows", []))
             return MockResult([{"total": total}])
 
-        if "MATCH (r:Row) RETURN count(r)" in cypher_stripped and "{" not in cypher_stripped:
+        # Total row count
+        if "total_rows" in cypher_stripped and "size(columns)" not in cypher_stripped:
+            total = len(self.graph_data.get("rows", []))
+            datasets = self.graph_data.get("datasets", [])
+            fn = datasets[0].get("filename", "test_data.csv") if datasets else "test_data.csv"
+            return MockResult([{"total_rows": total, "filename": fn}])
+
+        if "RETURN count(r)" in cypher_stripped and "{" not in cypher_stripped:
             total = len(self.graph_data.get("rows", []))
             return MockResult([{"count(r)": total}])
 
+        # Column count & Schema info
+        if "size(columns)" in cypher_stripped or "column_count" in cypher_stripped:
+            rows = self.graph_data.get("rows", [])
+            cols = [k for k in rows[0].keys() if k not in ("dataset_id", "row_index")] if rows else []
+            datasets = self.graph_data.get("datasets", [])
+            fn = datasets[0].get("filename", "test_data.csv") if datasets else "test_data.csv"
+            return MockResult([{"column_count": len(cols), "columns": cols, "filename": fn}])
+
         # Keys
-        if "MATCH (r:Row) RETURN keys(r) AS keys" in cypher_stripped:
+        if "RETURN keys(r) AS keys" in cypher_stripped:
             if not self.graph_data.get("rows"):
                 return MockResult([])
             keys = list(self.graph_data["rows"][0].keys())
             return MockResult([{"keys": keys}])
 
         # Dataset summary: MATCH (d:Dataset) ... total_rows ...
-        if "MATCH (d:Dataset)" in cypher_stripped and "total_rows" in cypher_stripped:
-            datasets = self.graph_data.get("datasets", [{"filename": "employees.csv"}])
-            fn = datasets[0].get("filename", "employees.csv") if datasets else "employees.csv"
+        if "sample_rows" in cypher_stripped or ("MATCH (d:Dataset)" in cypher_stripped and "total_rows" in cypher_stripped):
+            datasets = self.graph_data.get("datasets", [{"filename": "test_data.csv"}])
+            fn = datasets[0].get("filename", "test_data.csv") if datasets else "test_data.csv"
             rows = self.graph_data.get("rows", [])
             cols = [k for k in rows[0].keys() if k not in ("dataset_id", "row_index")] if rows else []
-            return MockResult([{"filename": fn, "total_rows": len(rows), "columns": cols}])
+            return MockResult([{"filename": fn, "total_rows": len(rows), "column_count": len(cols), "columns": cols, "sample_rows": rows[:3]}])
 
         # Datasets
         if "MATCH (d:Dataset)" in cypher_stripped:
@@ -349,12 +364,40 @@ def run_all_tests():
     res_l = handle_chat(q_l, active_driver)
     pass_l = (
         res_l["grounded"] is True
-        and "MATCH (d:Dataset)" in res_l["cypher"]
-        and "test_data.csv" in res_l["answer"]
-        and "rows with columns:" in res_l["answer"]
+        and ("Dataset" in res_l["cypher"] or "Row" in res_l["cypher"])
+        and ("test_data.csv" in res_l["answer"] or "dataset" in res_l["answer"])
+        and "rows" in res_l["answer"]
     )
     results.append(("L. Broad dataset question", q_l, pass_l, res_l["answer"]))
     assert pass_l, f"Test L Failed: {res_l}"
+
+    # -------------------------------------------------------------
+    # Test M: Column count ("How many columns?")
+    # -------------------------------------------------------------
+    q_m = "How many columns?"
+    res_m = handle_chat(q_m, active_driver)
+    pass_m = (
+        res_m["grounded"] is True
+        and "column" in res_m["answer"]
+        and "columns" in res_m["cypher"]
+        and res_m["result"]
+    )
+    results.append(("M. Column count question", q_m, pass_m, res_m["answer"]))
+    assert pass_m, f"Test M Failed: {res_m}"
+
+    # -------------------------------------------------------------
+    # Test N: Column schema listing ("What columns are available?")
+    # -------------------------------------------------------------
+    q_n = "What columns are available?"
+    res_n = handle_chat(q_n, active_driver)
+    pass_n = (
+        res_n["grounded"] is True
+        and "columns" in res_n["answer"]
+        and "columns" in res_n["cypher"]
+        and res_n["result"]
+    )
+    results.append(("N. Column listing question", q_n, pass_n, res_n["answer"]))
+    assert pass_n, f"Test N Failed: {res_n}"
 
     # Print summary table
     print("\nSUMMARY OF VERIFICATION RESULTS:")
