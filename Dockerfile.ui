@@ -1,5 +1,19 @@
-# Production Dockerfile for ZYNTAX UI Service
-# Pinned Nginx 1.27.4-alpine running strictly as non-root user (uid 101)
+# Multi-stage production build for ZYNTAX React Frontend Service
+
+# Stage 1: Build React static bundle with pinned Node LTS
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Deterministic dependency installation
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+# Copy frontend source and compile production assets
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Serve compiled assets with pinned Nginx Alpine running non-root (UID 101)
 FROM nginx:1.27.4-alpine
 
 # Set up non-root user environment (nginx user uid 101)
@@ -7,8 +21,18 @@ RUN sed -i 's/user  nginx;//g' /etc/nginx/nginx.conf && \
     touch /var/run/nginx.pid && \
     chown -R nginx:nginx /var/run/nginx.pid /var/cache/nginx /etc/nginx /usr/share/nginx/html
 
+# Copy reverse-proxy Nginx configuration
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy production bundle from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Ensure proper non-root file ownership
+RUN chown -R nginx:nginx /usr/share/nginx/html
+
 USER nginx
 
 EXPOSE 8080
 
 CMD ["nginx", "-g", "daemon off;"]
+

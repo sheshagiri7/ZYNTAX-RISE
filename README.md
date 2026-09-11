@@ -4,7 +4,7 @@
 Team ZYNTAX provides a decoupled data ingestion pipeline and a 100% grounded, read-only chatbot graph engine.
 
 ```
-CSV Upload -> Flask REST API -> Kafka (csv-rows) -> Loader Daemon -> Neo4j -> Grounded Chatbot
+React Frontend (Vite/TS) -> Nginx Proxy (Port 3000) -> Flask REST API -> Kafka (csv-rows) -> Loader Daemon -> Neo4j -> Grounded Chatbot
 ```
 
 ---
@@ -43,7 +43,7 @@ Navigate your browser to:
 
 | Service | Docker Container | Internal Port | Host Port | Role | User |
 |---|---|---|---|---|---|
-| **UI** | `zyntax-ui` | 8080 | **3000** | Reverse proxy & web dashboard | Non-root (`nginx` 101) |
+| **UI** | `zyntax-ui` | 8080 | **3000** | React web application served via Nginx reverse proxy | Non-root (`nginx` 101) |
 | **API** | `zyntax-api` | 5000 | **8000** | REST API (`/ingest`, `/status`, `/chat`) | Non-root (`appuser` 1001) |
 | **Kafka** | `zyntax-kafka` | 9092 | **9092** | KRaft broker (`csv-rows` topic) | Non-root (`appuser` 1000) |
 | **Loader** | `zyntax-loader` | N/A | N/A | Kafka consumer -> Neo4j MERGE | Non-root (`appuser` 1001) |

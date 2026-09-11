@@ -31,7 +31,7 @@ The application runs as five isolated Docker containers in a single Docker netwo
         +<--- Executes Safe Cypher <---------------- [ Neo4j 5.24 Graph DB ]
 ```
 
-1. **Frontend (zyntax-ui):** Pinned `nginx:1.27.4-alpine` running strictly non-root (UID 101), reverse-proxying API endpoints to decouple the client and eliminate CORS friction.
+1. **Frontend (zyntax-ui):** React 19 / TypeScript SPA compiled via Node 20 LTS multi-stage build and served through pinned `nginx:1.27.4-alpine` running strictly non-root (UID 101), reverse-proxying API endpoints to decouple the client and eliminate CORS friction.
 2. **Backend REST API (zyntax-api):** Flask 3.1.3 runtime in Python 3.11-slim (non-root `appuser` UID 1001). Validates CSVs, computes deterministic SHA-256 dataset identities, decouples ingestion via Kafka, tracks job state, and serves the grounded `/chat` endpoint.
 3. **Message Broker (zyntax-kafka):** Apache Kafka 3.7.0 running in single-broker KRaft mode (zero ZooKeeper dependency) with partitioned topic `csv-rows`. Decouples ingestion spikes from database writes.
 4. **Loader Daemon (zyntax-loader):** Dedicated Python 3.11-slim consumer (non-root UID 1001) that ingests row messages from Kafka and executes idempotent `MERGE` transactions into Neo4j.
