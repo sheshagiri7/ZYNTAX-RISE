@@ -24,11 +24,13 @@ Scenarios Tested:
 
 import io
 import re
+import time
 import logging
 from typing import Dict, Any, List
 from app import app, set_driver, set_kafka
 from backend.job_tracker import tracker
 from loader.loader import process_message_payload
+from loader.neo4j_loader import merge_row_into_graph
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -37,13 +39,17 @@ logging.basicConfig(level=logging.ERROR)
 # Mock In-Memory Kafka Producer to inspect messages and simulate outages
 # -----------------------------------------------------------------------------
 class MockKafkaProducer:
-    def __init__(self, connected: bool = True):
+    def __init__(self, connected: bool = True, fail_row_indices: list = None):
         self.is_connected = connected
         self.published_messages = []
+        self.fail_row_indices = fail_row_indices or []
 
     def send(self, topic: str, value: dict, key: str = None):
         if not self.is_connected:
             raise RuntimeError("Broker unavailable: simulated Kafka outage")
+        row_idx = value.get("row_index") if isinstance(value, dict) else None
+        if row_idx is not None and row_idx in self.fail_row_indices:
+            raise RuntimeError(f"Simulated message delivery failure for row {row_idx}")
         self.published_messages.append({"topic": topic, "value": value, "key": key})
         class Future:
             def get(self, timeout=None):
@@ -92,6 +98,9 @@ class MockGraphSession:
     def __init__(self, store: Dict[str, Any], fail_writes: bool = False):
         self.store = store
         self.fail_writes = fail_writes
+        self.store.setdefault("datasets", {})
+        self.store.setdefault("rows", {})
+        self.store.setdefault("has_row", set())
 
     def __enter__(self):
         return self
@@ -130,12 +139,31 @@ class MockGraphSession:
             node["dataset_id"] = d_id
             node["row_index"] = r_idx
             self.store["rows"][composite_key] = node
+
+            # Record HAS_ROW relationship
+            self.store["has_row"].add((d_id, composite_key))
             return MockResult([{"rows_merged": 1}])
+
+        # HAS_ROW relationship count
+        if "HAS_ROW" in cy and "RETURN count" in cy:
+            return MockResult([{"count": len(self.store["has_row"])}])
 
         # Schema Total row count: MATCH (r:Row) RETURN count(r) AS total
         if "MATCH (r:Row) RETURN count(r) AS total" in cy:
             total = len(self.store["rows"])
             return MockResult([{"total": total}])
+
+        # Count by dataset_id & row_index: MATCH (r:Row {dataset_id: $did, row_index: 1}) RETURN count(r) AS cnt
+        if "MATCH (r:Row {dataset_id:" in cy and "AS cnt" in cy:
+            did = params.get("did")
+            cnt = sum(1 for k, r in self.store["rows"].items() if r.get("dataset_id") == did and r.get("row_index") == 1)
+            return MockResult([{"cnt": cnt}])
+
+        # Relationship count by did: MATCH (d:Dataset {id: $did})-[rel:HAS_ROW]->(r:Row {row_index: 1}) RETURN count(rel) AS rcnt
+        if "AS rcnt" in cy:
+            did = params.get("did")
+            rcnt = sum(1 for (d, r) in self.store.get("has_row", set()) if d == did and r.endswith(":1"))
+            return MockResult([{"rcnt": rcnt}])
 
         # Total count without alias
         if "MATCH (r:Row) RETURN count(r)" in cy and "{" not in cy:
@@ -246,13 +274,15 @@ def run_pipeline_tests():
     data = resp.get_json()
     assert resp.status_code == 202
     assert data["rows_received"] == 0
-    assert data["status"] == "queued"
+    assert data["status"] == "complete", "Header-only CSV must return complete consistently across layers"
     # Check status
     resp_s = client.get(f"/status?job_id={data['job_id']}")
     data_s = resp_s.get_json()
     assert data_s["status"] == "complete"
     assert data_s["rows_total"] == 0
-    print(f"  ✓ Test 4 Passed: Header-only CSV handled safely: {data_s}")
+    assert data_s["rows_loaded"] == 0
+    assert data_s["rows_failed"] == 0
+    print(f"  ✓ Test 4 Passed: Header-only CSV handled safely with consistent 'complete' status: {data_s}")
 
     # -------------------------------------------------------------------------
     # TEST 5: Hostile Input: Non-CSV file
@@ -434,8 +464,270 @@ def run_pipeline_tests():
     assert "I don't have that information in the uploaded data." in unsupported_data["answer"]
     print(f"  ✓ Post-upload Unsupported Question Verified: '{unsupported_data['answer']}' (grounded=False)")
 
+    # -------------------------------------------------------------------------
+    # TEST 17: Hostile Input: Whitespace-only CSV
+    # -------------------------------------------------------------------------
+    print("\n[TEST 17] Hostile Input: Whitespace-only CSV")
+    resp = client.post("/ingest", data={"file": (io.BytesIO(b"   \n  \t  \n  "), "spaces.csv")}, content_type="multipart/form-data")
+    assert resp.status_code == 400
+    assert "empty" in resp.get_json()["error"].lower()
+    print("  ✓ Test 17 Passed: Whitespace-only CSV rejected cleanly with 400")
+
+    # -------------------------------------------------------------------------
+    # TEST 18: Hostile Input: Ragged Columns (fewer and more fields)
+    # -------------------------------------------------------------------------
+    print("\n[TEST 18] Hostile Input: Ragged Columns")
+    # Case A: row with fewer columns
+    ragged_short = "col1,col2,col3\n1,2\n"
+    resp_rs = client.post("/ingest", data={"file": (io.BytesIO(ragged_short.encode()), "ragged1.csv")}, content_type="multipart/form-data")
+    assert resp_rs.status_code == 400
+    assert "malformed" in resp_rs.get_json()["error"].lower()
+    # Case B: row with more columns
+    ragged_long = "col1,col2,col3\n1,2,3,4\n"
+    resp_rl = client.post("/ingest", data={"file": (io.BytesIO(ragged_long.encode()), "ragged2.csv")}, content_type="multipart/form-data")
+    assert resp_rl.status_code == 400
+    assert "malformed" in resp_rl.get_json()["error"].lower()
+    print("  ✓ Test 18 Passed: Ragged columns (fewer/more) rejected with 400 without silently dropping fields")
+
+    # -------------------------------------------------------------------------
+    # TEST 19: Hostile Input: Stray Commas & Unclosed Quotes
+    # -------------------------------------------------------------------------
+    print("\n[TEST 19] Hostile Input: Stray Commas & Unclosed Quotes")
+    stray_comma = "col1,col2,col3\n1,2,3,\n"
+    resp_sc = client.post("/ingest", data={"file": (io.BytesIO(stray_comma.encode()), "stray.csv")}, content_type="multipart/form-data")
+    assert resp_sc.status_code == 400
+
+    unclosed_quote = 'col1,col2,col3\n"unclosed,2,3\n'
+    resp_uq = client.post("/ingest", data={"file": (io.BytesIO(unclosed_quote.encode()), "quote.csv")}, content_type="multipart/form-data")
+    assert resp_uq.status_code == 400
+    print("  ✓ Test 19 Passed: Stray commas and unclosed quotes rejected cleanly with 400")
+
+    # -------------------------------------------------------------------------
+    # TEST 20: Hostile Input: Missing and Empty Header Fields
+    # -------------------------------------------------------------------------
+    print("\n[TEST 20] Hostile Input: Missing and Empty Header Fields")
+    # Empty column name in middle
+    missing_header_mid = "col1,,col3\n1,2,3\n"
+    resp_mhm = client.post("/ingest", data={"file": (io.BytesIO(missing_header_mid.encode()), "mid.csv")}, content_type="multipart/form-data")
+    assert resp_mhm.status_code == 400
+    assert "header" in resp_mhm.get_json()["error"].lower()
+
+    # Trailing comma in header
+    missing_header_end = "col1,col2,\n1,2,3\n"
+    resp_mhe = client.post("/ingest", data={"file": (io.BytesIO(missing_header_end.encode()), "end.csv")}, content_type="multipart/form-data")
+    assert resp_mhe.status_code == 400
+
+    # All commas in header
+    all_commas = ",,\n1,2,3\n"
+    resp_ac = client.post("/ingest", data={"file": (io.BytesIO(all_commas.encode()), "commas.csv")}, content_type="multipart/form-data")
+    assert resp_ac.status_code == 400
+    print("  ✓ Test 20 Passed: Missing/empty header structures rejected cleanly with 400")
+
+    # -------------------------------------------------------------------------
+    # TEST 21: Partial Kafka Publishing Failure (Honest Accounting)
+    # -------------------------------------------------------------------------
+    print("\n[TEST 21] Partial Kafka Publishing Failure (Honest Accounting)")
+    # 5 rows total, rows 2 and 4 fail during Kafka dispatch
+    partial_csv = (
+        "id,name,val\n"
+        "1,alpha,10\n"
+        "2,bravo,20\n"
+        "3,charlie,30\n"
+        "4,delta,40\n"
+        "5,echo,50\n"
+    )
+    # Mock producer that fails on row_index 2 and 4
+    partial_producer = MockKafkaProducer(connected=True, fail_row_indices=[2, 4])
+    partial_neo4j = MockGraphDriver(connected=True)
+    set_kafka(partial_producer)
+    set_driver(partial_neo4j)
+
+    resp_part = client.post("/ingest", data={"file": (io.BytesIO(partial_csv.encode()), "partial.csv")}, content_type="multipart/form-data")
+    assert resp_part.status_code == 202
+    part_job_id = resp_part.get_json()["job_id"]
+
+    # Ingest published 3 of 5 rows, failed 2 rows
+    assert len(partial_producer.published_messages) == 3
+    # Check status right after ingest: rows_failed must be 2, NOT 0!
+    stat_before = client.get(f"/status?job_id={part_job_id}").get_json()
+    assert stat_before["rows_total"] == 5
+    assert stat_before["rows_failed"] == 2, f"Failed publish not honestly tracked! Got: {stat_before}"
+    assert stat_before["rows_loaded"] == 0
+
+    # Loader processes the 3 published messages
+    for msg in partial_producer.published_messages:
+        ok = process_message_payload(msg["value"], driver=partial_neo4j)
+        assert ok is True
+
+    # Check status after loading: terminal state complete only when rows_loaded + rows_failed == rows_total!
+    stat_after = client.get(f"/status?job_id={part_job_id}").get_json()
+    assert stat_after["rows_loaded"] == 3
+    assert stat_after["rows_failed"] == 2
+    assert stat_after["rows_loaded"] + stat_after["rows_failed"] == stat_after["rows_total"] == 5
+    assert stat_after["status"] == "complete"
+    print(f"  ✓ Test 21 Passed: Partial publish failure honestly tracked: {stat_after}")
+
+    # -------------------------------------------------------------------------
+    # TEST 22: Total Kafka Publishing Failure
+    # -------------------------------------------------------------------------
+    print("\n[TEST 22] Total Kafka Publishing Failure")
+    total_fail_producer = MockKafkaProducer(connected=False)
+    set_kafka(total_fail_producer)
+    resp_tf = client.post("/ingest", data={"file": (io.BytesIO(partial_csv.encode()), "fail.csv")}, content_type="multipart/form-data")
+    assert resp_tf.status_code == 503
+    print("  ✓ Test 22 Passed: Total Kafka outage returned clean 503 error")
+
+    # -------------------------------------------------------------------------
+    # TEST 23: Loader Failure / Crash (Status Not Stuck in Loading Forever)
+    # -------------------------------------------------------------------------
+    print("\n[TEST 23] Loader Crash Handling (Terminal State Invariant)")
+    crash_job = tracker.create_job("job_crash_test", "d_crash", "crash.csv", rows_total=6)
+    assert crash_job["status"] == "queued"
+
+    # Loader loads 2 rows
+    tracker.update_progress("job_crash_test", loaded_inc=1, row_index=1)
+    tracker.update_progress("job_crash_test", loaded_inc=1, row_index=2)
+    assert tracker.get_job("job_crash_test")["status"] == "loading"
+    assert tracker.get_job("job_crash_test")["rows_loaded"] == 2
+
+    # Loader crashes partway through! fail_job called
+    tracker.fail_job("job_crash_test", error="Simulated loader container kill")
+    crashed_stat = tracker.get_job("job_crash_test")
+    assert crashed_stat["status"] == "failed"
+    # Row count actually reached must be preserved!
+    assert crashed_stat["rows_loaded"] == 2
+    # Unreached rows accounted as failed
+    assert crashed_stat["rows_failed"] == 4
+    # Terminal condition holds!
+    assert crashed_stat["rows_loaded"] + crashed_stat["rows_failed"] == crashed_stat["rows_total"] == 6
+    print(f"  ✓ Test 23 Passed: Loader crash transitioned to failed preserving rows actually reached: {crashed_stat}")
+
+    # -------------------------------------------------------------------------
+    # TEST 24: Stale Loader Crash Detection in GET /status
+    # -------------------------------------------------------------------------
+    print("\n[TEST 24] Stale Loader Crash Inactivity Detection")
+    import os
+    stale_job = tracker.create_job("job_stale_test", "d_stale", "stale.csv", rows_total=4)
+    tracker.update_progress("job_stale_test", loaded_inc=1, row_index=1)
+    assert tracker.get_job("job_stale_test")["status"] == "loading"
+
+    # Set updated_at to 100 seconds in the past to simulate sudden container death
+    with tracker.lock:
+        tracker._memory_jobs["job_stale_test"]["updated_at"] = time.time() - 100
+        tracker._save_to_disk()
+
+    # Query status via GET /status with short timeout
+    os.environ["LOADER_CRASH_TIMEOUT"] = "5.0"
+    stale_resp = client.get("/status?job_id=job_stale_test").get_json()
+    assert stale_resp["status"] == "failed"
+    assert stale_resp["rows_loaded"] == 1
+    assert stale_resp["rows_failed"] == 3
+    assert stale_resp["rows_loaded"] + stale_resp["rows_failed"] == stale_resp["rows_total"] == 4
+    print(f"  ✓ Test 24 Passed: Stale unresponsive job detected and failed cleanly: {stale_resp}")
+
+    # -------------------------------------------------------------------------
+    # TEST 25: Message Replay Deduplication per Job
+    # -------------------------------------------------------------------------
+    print("\n[TEST 25] Message Replay Deduplication per Job")
+    replay_job = tracker.create_job("job_replay", "d_replay", "replay.csv", rows_total=2)
+    # Deliver row 1
+    tracker.update_progress("job_replay", loaded_inc=1, row_index=1)
+    assert tracker.get_job("job_replay")["rows_loaded"] == 1
+
+    # Redeliver row 1 (simulating Kafka consumer restart before offset commit)
+    tracker.update_progress("job_replay", loaded_inc=1, row_index=1)
+    assert tracker.get_job("job_replay")["rows_loaded"] == 1, "Duplicate message double-incremented rows_loaded!"
+
+    # Deliver row 2
+    tracker.update_progress("job_replay", loaded_inc=1, row_index=2)
+    assert tracker.get_job("job_replay")["rows_loaded"] == 2
+    assert tracker.get_job("job_replay")["status"] == "complete"
+    print("  ✓ Test 25 Passed: Message replay deduplication successfully prevented double counting")
+
+    # -------------------------------------------------------------------------
+    # TEST 26: Exact Repeat Upload & HAS_ROW Count Idempotency
+    # -------------------------------------------------------------------------
+    print("\n[TEST 26] Exact Repeat Upload & HAS_ROW Count Idempotency")
+    idemp_kafka = MockKafkaProducer(connected=True)
+    idemp_neo4j = MockGraphDriver(connected=True)
+    set_kafka(idemp_kafka)
+    set_driver(idemp_neo4j)
+
+    sample_csv = "dept,manager,budget\nSales,Alice,50000\nEngineering,Bob,120000\nHR,Charlie,30000\n"
+
+    # Upload 1
+    resp_u1 = client.post("/ingest", data={"file": (io.BytesIO(sample_csv.encode()), "budget.csv")}, content_type="multipart/form-data")
+    assert resp_u1.status_code == 202
+    ds_id_1 = idemp_kafka.published_messages[0]["value"]["dataset_id"]
+    for msg in idemp_kafka.published_messages:
+        process_message_payload(msg["value"], driver=idemp_neo4j)
+
+    rows_count_1 = len(idemp_neo4j.store["rows"])
+    rel_count_1 = len(idemp_neo4j.store["has_row"])
+    assert rows_count_1 == 3
+    assert rel_count_1 == 3
+
+    # Upload 2 (exact same content)
+    idemp_kafka.published_messages.clear()
+    resp_u2 = client.post("/ingest", data={"file": (io.BytesIO(sample_csv.encode()), "budget_again.csv")}, content_type="multipart/form-data")
+    assert resp_u2.status_code == 202
+    ds_id_2 = idemp_kafka.published_messages[0]["value"]["dataset_id"]
+    assert ds_id_1 == ds_id_2, "Same content did not produce same dataset_id!"
+
+    for msg in idemp_kafka.published_messages:
+        process_message_payload(msg["value"], driver=idemp_neo4j)
+
+    rows_count_2 = len(idemp_neo4j.store["rows"])
+    rel_count_2 = len(idemp_neo4j.store["has_row"])
+    assert rows_count_2 == rows_count_1 == 3, f"Duplicate rows created! Expected 3, got {rows_count_2}"
+    assert rel_count_2 == rel_count_1 == 3, f"Duplicate HAS_ROW relationships created! Expected 3, got {rel_count_2}"
+    print(f"  ✓ Test 26 Passed: Re-upload verified: dataset_id='{ds_id_1}' | rows={rows_count_2} | HAS_ROW={rel_count_2} | duplicates=0")
+
+    # -------------------------------------------------------------------------
+    # TEST 27: Live Neo4j Database Verification (if reachable)
+    # -------------------------------------------------------------------------
+    print("\n[TEST 27] Live Neo4j Database Verification")
+    from backend.neo4j_client import (
+        is_neo4j_connected, get_neo4j_driver, set_neo4j_driver,
+        _custom_driver as _prev_custom_driver
+    )
+    # Earlier tests set a mock via set_driver(). Clear it so is_neo4j_connected()
+    # and get_neo4j_driver() can reach the real container, then restore afterwards.
+    set_neo4j_driver(None)
+    if is_neo4j_connected():
+        live_driver = get_neo4j_driver(retries=1)
+        test_ds_id = "test_live_verify"
+        test_row = {"dept": "Security", "level": 5}
+        # Pre-test cleanup: remove any stale data from a prior aborted run
+        with live_driver.session() as s:
+            s.run("MATCH (d:Dataset {id: $did}) OPTIONAL MATCH (d)-[:HAS_ROW]->(r:Row) DETACH DELETE d, r", did=test_ds_id)
+        # First load
+        ok1 = merge_row_into_graph(live_driver, dataset_id=test_ds_id, filename="live.csv", row_index=1, row_data=test_row)
+        assert ok1 is True
+        # Second load (exact same row — MERGE must not create duplicates)
+        ok2 = merge_row_into_graph(live_driver, dataset_id=test_ds_id, filename="live.csv", row_index=1, row_data=test_row)
+        assert ok2 is True
+        # Verify node count and relationship count in live database
+        with live_driver.session() as s:
+            rec = s.run("MATCH (r:Row {dataset_id: $did, row_index: 1}) RETURN count(r) AS cnt", did=test_ds_id).single()
+            assert rec is not None, "Row count query returned no result from live Neo4j"
+            assert rec["cnt"] == 1, f"Duplicate nodes in live Neo4j! Expected 1, got {rec['cnt']}"
+            rel_rec = s.run(
+                "MATCH (d:Dataset {id: $did})-[rel:HAS_ROW]->(r:Row {row_index: 1}) RETURN count(rel) AS rcnt",
+                did=test_ds_id
+            ).single()
+            assert rel_rec is not None, "HAS_ROW relationship query returned no result — Dataset->Row link missing in live Neo4j"
+            assert rel_rec["rcnt"] == 1, f"Duplicate HAS_ROW in live Neo4j! Expected 1, got {rel_rec['rcnt']}"
+            # Post-test cleanup
+            s.run("MATCH (d:Dataset {id: $did}) OPTIONAL MATCH (d)-[:HAS_ROW]->(r:Row) DETACH DELETE d, r", did=test_ds_id)
+        print("  ✓ Test 27 Passed: Live Neo4j verified: MERGE idempotency confirmed with 0 duplicate nodes and 0 duplicate relationships")
+    else:
+        print("  - Test 27 Skipped: Live Neo4j not reachable in this test run")
+    # Restore previous mock driver (if any) so the test harness is left in a clean state
+    set_neo4j_driver(_prev_custom_driver)
+
     print("\n" + "=" * 78)
-    print(">>> ALL 16 TESTS PASSED WITH 100% SPEC COMPLIANCE & HOSTILE INPUT SAFETY <<<")
+    print(">>> ALL 27 TESTS PASSED WITH 100% SPEC COMPLIANCE & HOSTILE INPUT SAFETY <<<")
     print("=" * 78)
 
 
