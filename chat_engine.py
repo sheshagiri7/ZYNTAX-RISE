@@ -746,8 +746,23 @@ def generate_cypher_template(
             return cypher, "group_breakdown", True
 
     # 12. Total row count query
-    # e.g., "how many rows?", "how many records?", "total rows?", "row count?", "what about rows?"
-    if re.search(r"\b(how\s+many\s+(?:total\s+)?(?:rows|records)|what\s+is\s+the\s+(?:number\s+of\s+rows|row\s+count)|number\s+of\s+rows|row\s+count|total\s+(?:number\s+of\s+)?rows|count\s+(?:total\s+)?rows|total\s+records|what\s+about\s+(?:the\s+)?rows?|how\s+about\s+(?:the\s+)?rows?)\b", q_lower):
+    # e.g., "how many rows?", "how many records?", "total number of records?",
+    # "what is the row count?", "number of records?", "record count?", "how many entries?"
+    _row_count_re = re.compile(
+        r"\b("
+        r"how\s+many\s+(?:total\s+)?(?:rows|records|entries)"
+        r"|what\s+is\s+(?:the\s+)?(?:total\s+)?(?:number\s+of\s+(?:rows|records|entries)|row\s+count|record\s+count|entry\s+count)"
+        r"|what(?:'s|s)?\s+(?:the\s+)?total\s+number\s+of\s+(?:rows|records|entries)"
+        r"|number\s+of\s+(?:rows|records|entries)"
+        r"|(?:row|record|entry)\s+count"
+        r"|total\s+(?:number\s+of\s+)?(?:rows|records|entries)"
+        r"|count\s+(?:total\s+)?(?:rows|records)"
+        r"|what\s+about\s+(?:the\s+)?rows?"
+        r"|how\s+about\s+(?:the\s+)?rows?"
+        r")\b",
+        re.IGNORECASE
+    )
+    if _row_count_re.search(q_lower):
         if is_mock:
             cypher = "MATCH (r:Row) RETURN count(r)"
         else:

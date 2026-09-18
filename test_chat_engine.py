@@ -31,6 +31,9 @@ class MockRecord:
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
 
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
 
 class MockResult:
     def __init__(self, records: List[Dict[str, Any]]):
@@ -148,6 +151,29 @@ class MockSession:
                 val = r.get(col, "Unknown")
                 counts[val] = counts.get(val, 0) + 1
             return MockResult([{col: k, "count": v} for k, v in counts.items()])
+
+        # Numeric aggregation: RETURN avg(...) AS avg_val, min(...) AS min_val, max(...) AS max_val, sum(...) AS sum_val
+        if "sum_val" in cypher_stripped and "avg_val" in cypher_stripped:
+            import re
+            m = re.search(r"r\.(\w+)\s+IS\s+NOT\s+NULL", cypher_stripped)
+            col = m.group(1) if m else None
+            if col:
+                vals = []
+                for r in self.graph_data.get("rows", []):
+                    v = r.get(col)
+                    if v is not None:
+                        try:
+                            vals.append(float(str(v).replace(",", "").strip()))
+                        except (ValueError, TypeError):
+                            pass
+                if vals:
+                    return MockResult([{
+                        "avg_val": sum(vals) / len(vals),
+                        "min_val": min(vals),
+                        "max_val": max(vals),
+                        "sum_val": sum(vals),
+                    }])
+            return MockResult([])
 
         return MockResult([])
 
@@ -399,7 +425,77 @@ def run_all_tests():
     results.append(("N. Column listing question", q_n, pass_n, res_n["answer"]))
     assert pass_n, f"Test N Failed: {res_n}"
 
-    # Print summary table
+    # -----------------------------------------------------------------------
+    # Test O: Row-Count Synonyms (Bug 1 fix — adversarial judge failures)
+    # All of these must resolve to total_count with grounded=True
+    # -----------------------------------------------------------------------
+    row_count_synonyms = [
+        "how many rows?",
+        "how many records?",
+        "how many entries?",
+        "total rows?",
+        "total records?",
+        "What is the total number of records?",
+        "what's the total number of records?",
+        "number of records?",
+        "record count?",
+        "What is the row count?",
+        "what is the number of records?",
+    ]
+    pass_o = True
+    failed_o = []
+    for q_syn in row_count_synonyms:
+        res_syn = handle_chat(q_syn, active_driver)
+        ok = (
+            res_syn["grounded"] is True
+            and "4" in res_syn["answer"]           # 4 rows in sample_rows
+            and "MATCH (r:Row) RETURN count(r)" in res_syn["cypher"]
+        )
+        if not ok:
+            pass_o = False
+            failed_o.append((q_syn, res_syn))
+    results.append(("O. Row-count synonyms (11 variants)", "adversarial row count set", pass_o,
+                    f"All {len(row_count_synonyms)} passed" if pass_o else f"FAILED: {failed_o}"))
+    assert pass_o, f"Test O Failed — some row-count synonyms returned wrong result: {failed_o}"
+
+    # -----------------------------------------------------------------------
+    # Test P: SUM Aggregation Synonyms (Bug 2 fix — "total <numeric col>")
+    # All of these must resolve to numeric_sum with grounded=True
+    # -----------------------------------------------------------------------
+    # active_driver has 'amount' as a numeric column (values 100, 200, 300, 150)
+    sum_synonyms = [
+        ("What is the total amount?", "amount", 750.0),
+        ("total of amount?", "amount", 750.0),
+        ("sum of amount?", "amount", 750.0),
+        ("amount total?", "amount", 750.0),
+        ("what is the total amount?", "amount", 750.0),
+    ]
+    pass_p = True
+    failed_p = []
+    for q_sum, col_name, expected_sum in sum_synonyms:
+        res_sum = handle_chat(q_sum, active_driver)
+        ok = (
+            res_sum["grounded"] is True
+            and "sum_val" in res_sum["cypher"]
+            and str(int(expected_sum)) in res_sum["answer"]
+        )
+        if not ok:
+            pass_p = False
+            failed_p.append((q_sum, res_sum))
+    results.append(("P. SUM aggregation synonyms (5 variants)", "adversarial sum set", pass_p,
+                    f"All {len(sum_synonyms)} passed" if pass_p else f"FAILED: {failed_p}"))
+    assert pass_p, f"Test P Failed — some SUM synonyms returned wrong result: {failed_p}"
+
+    # -----------------------------------------------------------------------
+    # Test Q: Ambiguous "What is the total?" → grounded=False
+    # "total" alone without a column name must NOT resolve to row-count or sum
+    # -----------------------------------------------------------------------
+    q_q = "What is the total?"
+    res_q = handle_chat(q_q, active_driver)
+    pass_q = res_q["grounded"] is False
+    results.append(("Q. Ambiguous 'total' → grounded=False", q_q, pass_q, res_q["answer"]))
+    assert pass_q, f"Test Q Failed: ambiguous 'total' should be grounded=False, got: {res_q}"
+
     print("\nSUMMARY OF VERIFICATION RESULTS:")
     print(f"{'Scenario':<40} | {'Status':<6} | {'Details'}")
     print("-" * 75)
